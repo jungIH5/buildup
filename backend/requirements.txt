@@ -1,0 +1,16 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+anthropic==0.45.2
+pydantic==2.8.2
+pydantic-settings==2.4.0
+shapely==2.0.6
+networkx==3.3
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+pdfplumber==0.11.4
+supabase==2.7.2
+python-dotenv==1.0.1
+trimesh==4.4.9        # .glb 생성용
+numpy==1.26.4
+pymupdf==1.24.10
