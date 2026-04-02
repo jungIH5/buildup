@@ -58,9 +58,11 @@ class Equipment(BaseModel):
 
 class ReferencePoint(BaseModel):
     """기준점 — Agent 3이 이것만 참조하여 배치 의도 결정"""
-    name: str                          # 예: "entrance", "north_wall_mid"
-    position_mm: tuple[float, float]   # mm 단위 실제 좌표
-    facing: Optional[str] = None       # 예: "south", "inward"
+    name: str                              # 예: "entrance", "north_wall_mid"
+    position_mm: tuple[float, float]       # mm 단위 실제 좌표
+    facing: Optional[str] = None           # 예: "south", "inward"
+    zone_label: Optional[str] = None       # "entrance_zone" | "mid_zone" | "deep_zone"
+    walk_distance_mm: Optional[float] = None  # 입구에서 보행 거리 (mm)
 
 
 class FloorAnalysis(BaseModel):

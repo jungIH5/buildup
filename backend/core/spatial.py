@@ -9,7 +9,9 @@ spatial.py — Shapely 기반 공간 분석 및 배치 계산
 """
 
 from __future__ import annotations
-from shapely.geometry import Polygon, box
+import math
+import networkx as nx
+from shapely.geometry import Polygon, Point, box
 from shapely.affinity import rotate
 from core.schemas import (
     FloorAnalysis, PlacementIntent, PlacedObject,
@@ -21,9 +23,77 @@ from core.violations import (
     aggregate_violations,
 )
 
-# 코드 레벨 위치 조정 파라미터 (Sprint 5에서 조정 예정)
+# 코드 레벨 위치 조정 파라미터
 STEP_MM: float = 50.0    # 한 번 밀 때 이동 거리
 MAX_STEPS: int = 20       # 최대 시도 횟수
+CORRIDOR_GRID_MM: float = 150.0   # 통로 체크 격자 크기
+
+
+def _build_walkability_graph(
+    room_poly: Polygon,
+    obstacles: list[Polygon],
+    grid_mm: float = CORRIDOR_GRID_MM,
+) -> tuple[nx.Graph, set[tuple[int, int]]]:
+    """
+    방 내부 격자 그래프 생성 (장애물 노드 제외).
+    반환: (Graph, node_set)
+    """
+    G: nx.Graph = nx.Graph()
+    node_set: set[tuple[int, int]] = set()
+    step = int(grid_mm)
+    minx, miny, maxx, maxy = room_poly.bounds
+
+    for x in range(int(minx), int(maxx) + step, step):
+        for y in range(int(miny), int(maxy) + step, step):
+            pt = Point(x, y)
+            if room_poly.contains(pt) and not any(obs.contains(pt) for obs in obstacles):
+                G.add_node((x, y))
+                node_set.add((x, y))
+
+    for (x, y) in list(G.nodes()):
+        for dx, dy in [(step, 0), (0, step)]:
+            nb = (x + dx, y + dy)
+            if nb in node_set:
+                G.add_edge((x, y), nb, weight=math.sqrt(dx ** 2 + dy ** 2))
+
+    return G, node_set
+
+
+def _corridor_ok(
+    G_base: nx.Graph,
+    new_obj_poly: Polygon,
+    entrance_pos: tuple[float, float],
+    placed_polys: list[Polygon] | None = None,
+    min_reachable_fraction: float = 0.5,
+) -> bool:
+    """
+    새 오브젝트 + 이미 배치된 오브젝트들을 포함해 입구에서 방의 50% 이상
+    노드에 도달 가능한지 확인. 통로가 막히면 False.
+    """
+    if not G_base.nodes():
+        return True
+
+    # 새 오브젝트 + 기존 배치 오브젝트가 차지하는 노드 제거
+    blocked: set = {n for n in G_base.nodes() if new_obj_poly.contains(Point(n[0], n[1]))}
+    if placed_polys:
+        for poly in placed_polys:
+            blocked |= {n for n in G_base.nodes() if poly.contains(Point(n[0], n[1]))}
+
+    if not blocked:
+        return True
+
+    G_temp = G_base.copy()
+    G_temp.remove_nodes_from(blocked)
+
+    if not G_temp.nodes():
+        return False
+
+    entrance_node = min(
+        G_temp.nodes(),
+        key=lambda n: (n[0] - entrance_pos[0]) ** 2 + (n[1] - entrance_pos[1]) ** 2,
+    )
+    component = nx.node_connected_component(G_temp, entrance_node)
+    return len(component) / len(G_temp.nodes()) >= min_reachable_fraction
 
 
 def build_dead_zones(
@@ -78,10 +148,13 @@ def try_place_object(
     room_poly: Polygon,
     dead_zones: list[Polygon],
     placed_polys: list[Polygon],
+    corridor_graph: nx.Graph | None = None,
+    entrance_pos: tuple[float, float] | None = None,
 ) -> tuple[Polygon | None, float, float]:
     """
     주어진 위치에 오브젝트 배치 시도.
     충돌 시 STEP_MM 씩 밀어서 MAX_STEPS 회까지 재시도.
+    corridor_graph + entrance_pos 제공 시 NetworkX 통로 연결성도 검사.
     성공하면 (polygon, cx, cy), 실패하면 (None, cx, cy).
     """
     directions = [(1, 0), (0, 1), (-1, 0), (0, -1),
@@ -97,24 +170,24 @@ def try_place_object(
 
             obj_poly = make_object_polygon(test_cx, test_cy, width_mm, height_mm, rotation_deg)
 
-            # 룸 외곽 이탈 체크
             if not room_poly.contains(obj_poly):
                 continue
-
-            # Dead Zone 충돌 체크
             if any(obj_poly.intersects(dz) for dz in dead_zones):
                 continue
-
-            # 기존 배치 오브젝트 충돌 체크
             if any(obj_poly.intersects(p) for p in placed_polys):
                 continue
+
+            # NetworkX 통로 연결성 체크 (이미 배치된 오브젝트 포함)
+            if corridor_graph is not None and entrance_pos is not None:
+                if not _corridor_ok(corridor_graph, obj_poly, entrance_pos, placed_polys):
+                    continue
 
             return obj_poly, test_cx, test_cy
 
         if step == 0:
-            continue  # step 0은 방향 없이 한 번만
+            continue
 
-    return None, cx, cy  # 모든 시도 실패
+    return None, cx, cy
 
 
 def compute_layout(
@@ -140,6 +213,11 @@ def compute_layout(
     placed_polys: list[Polygon] = list(initial_placed_polys) if initial_placed_polys else []
     failed_objects: list[dict] = []
     all_violations: list[Violation] = []
+
+    # 입구 위치 + NetworkX 기본 격자 그래프 (Dead Zone만 제외, 오브젝트 제외 전)
+    entrance_rp = next((rp for rp in floor.reference_points if rp.name == "entrance"), None)
+    entrance_pos: tuple[float, float] | None = entrance_rp.position_mm if entrance_rp else None
+    corridor_graph, _ = _build_walkability_graph(room_poly, dead_zones)
 
     # priority 순 정렬
     sorted_placements = sorted(placements, key=lambda p: p.priority)
@@ -170,17 +248,18 @@ def compute_layout(
         cx, cy = ref_pos
         rotation_deg = _direction_to_rotation(intent.direction)
 
-        # 배치 시도 (코드 레벨 위치 조정 포함)
+        # 배치 시도 (Shapely 충돌 + NetworkX 통로 연결성 체크)
         obj_poly, final_cx, final_cy = try_place_object(
             cx, cy, width_mm, height_mm, rotation_deg,
             room_poly, dead_zones, placed_polys,
+            corridor_graph=corridor_graph,
+            entrance_pos=entrance_pos,
         )
 
         if obj_poly is None:
-            # 완전 실패 → failed 목록에 기록
             failed_objects.append({
                 "object_type": intent.object_type,
-                "reason": f"'{intent.reference_point}' 기준점 주변 {MAX_STEPS * STEP_MM:.0f}mm 내에 배치 가능 공간 없음",
+                "reason": f"'{intent.reference_point}' 기준점 주변 {MAX_STEPS * STEP_MM:.0f}mm 내에 배치 가능 공간 없음 (통로 포함)",
                 "reference_point": intent.reference_point,
                 "tried_steps": MAX_STEPS,
             })

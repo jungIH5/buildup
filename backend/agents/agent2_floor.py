@@ -9,11 +9,14 @@ agent2_floor.py — Agent 2: 도면 분석 + Dead Zone 생성
 from __future__ import annotations
 import base64
 import json
+import math
 import re
 from typing import Optional
 import cv2
+import networkx as nx
 import numpy as np
 import anthropic
+from shapely.geometry import Point as SPoint, Polygon as SPolygon
 from core.schemas import (
     BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel
 )
@@ -501,6 +504,15 @@ async def run_agent2(
 
     # ── 공통: reference_point, dead_zone 생성 ──────────
     reference_points = _generate_reference_points(room_polygon_mm, all_equipment)
+
+    # NetworkX 보행 거리 계산 → zone_label 할당
+    entrance_pos = next(
+        (rp.position_mm for rp in reference_points if rp.name == "entrance"),
+        None,
+    )
+    if entrance_pos:
+        reference_points = _assign_zone_labels(reference_points, room_polygon_mm, entrance_pos)
+
     dead_zones_mm = _generate_dead_zones(all_equipment, standards)
     eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
 
@@ -519,6 +531,76 @@ async def run_agent2(
 
     image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
     return floor, constraints, image_meta
+
+
+def _assign_zone_labels(
+    reference_points: list[ReferencePoint],
+    room_polygon_mm: list[tuple[float, float]],
+    entrance_pos: tuple[float, float],
+    grid_mm: float = 200.0,
+) -> list[ReferencePoint]:
+    """
+    NetworkX 격자 그래프로 입구→각 기준점 보행 거리 계산.
+    거리 비율로 zone_label 할당:
+      0~33%  → entrance_zone
+      33~67% → mid_zone
+      67~100%→ deep_zone
+    """
+    if not room_polygon_mm or len(room_polygon_mm) < 3:
+        return reference_points
+
+    try:
+        room_poly = SPolygon(room_polygon_mm)
+        minx, miny, maxx, maxy = room_poly.bounds
+        step = int(grid_mm)
+
+        # 방 내부 격자 노드 생성
+        G: nx.Graph = nx.Graph()
+        node_set: set[tuple[int, int]] = set()
+        for x in range(int(minx), int(maxx) + step, step):
+            for y in range(int(miny), int(maxy) + step, step):
+                if room_poly.contains(SPoint(x, y)):
+                    G.add_node((x, y))
+                    node_set.add((x, y))
+
+        # 4방향 + 대각선 엣지
+        for (x, y) in list(G.nodes()):
+            for dx, dy in [(step, 0), (0, step), (step, step), (-step, step)]:
+                nb = (x + dx, y + dy)
+                if nb in node_set:
+                    G.add_edge((x, y), nb, weight=math.sqrt(dx ** 2 + dy ** 2))
+
+        if not G.nodes():
+            return reference_points
+
+        # 입구에서 가장 가까운 노드
+        entrance_node = min(
+            G.nodes(),
+            key=lambda n: (n[0] - entrance_pos[0]) ** 2 + (n[1] - entrance_pos[1]) ** 2,
+        )
+        walk_dists: dict = nx.single_source_dijkstra_path_length(G, entrance_node, weight="weight")
+        max_dist = max(walk_dists.values()) if walk_dists else 1.0
+
+        updated: list[ReferencePoint] = []
+        for rp in reference_points:
+            nearest = min(
+                G.nodes(),
+                key=lambda n: (n[0] - rp.position_mm[0]) ** 2 + (n[1] - rp.position_mm[1]) ** 2,
+            )
+            dist = walk_dists.get(nearest, max_dist)
+            ratio = dist / max_dist if max_dist > 0 else 0.0
+            zone = "entrance_zone" if ratio < 0.33 else ("mid_zone" if ratio < 0.67 else "deep_zone")
+            updated.append(ReferencePoint(
+                name=rp.name,
+                position_mm=rp.position_mm,
+                facing=rp.facing,
+                zone_label=zone,
+                walk_distance_mm=round(dist, 1),
+            ))
+        return updated
+
+    except Exception:
+        return reference_points
 
 
 def _generate_reference_points(
@@ -562,19 +644,46 @@ def _generate_dead_zones(
     equipment: list[Equipment],
     standards: BrandStandards,
 ) -> list[list[tuple[float, float]]]:
-    """설비 주변 Dead Zone — position_mm 직접 사용"""
+    """
+    설비 주변 Dead Zone — position_mm 직접 사용.
+
+    비상구(exit/emergency_exit):
+      - 비상구 직접 인접 구역: emergency_path_min_mm(기본 1200mm) 반경 사각형
+      - 비상구 앞 동선 확보: 비상구 내측 방향으로 emergency_path_min_mm × (emergency_path_min_mm*2) 직사각형
+    기타 설비: wall_clearance_mm 반경 사각형
+    """
     dead_zones = []
-    radius = standards.wall_clearance_mm
     for eq in equipment:
         if eq.position_mm is None:
             continue
         mx, my = eq.position_mm
-        dead_zones.append([
-            (mx - radius, my - radius),
-            (mx + radius, my - radius),
-            (mx + radius, my + radius),
-            (mx - radius, my + radius),
-        ])
+
+        if eq.equipment_type in ("exit", "emergency_exit"):
+            # ① 비상구 직접 인접 사각 Dead Zone (1200mm 반경)
+            r = standards.emergency_path_min_mm
+            dead_zones.append([
+                (mx - r, my - r),
+                (mx + r, my - r),
+                (mx + r, my + r),
+                (mx - r, my + r),
+            ])
+            # ② 비상구 앞 통로 Dead Zone: 비상구에서 실내 방향으로 추가 1200mm 확보
+            # 비상구는 보통 벽 경계에 있으므로 내측(y 감소 방향)으로 복도를 확보
+            corridor_depth = standards.emergency_path_min_mm  # 1200mm 추가
+            dead_zones.append([
+                (mx - r / 2, my - r - corridor_depth),
+                (mx + r / 2, my - r - corridor_depth),
+                (mx + r / 2, my - r),
+                (mx - r / 2, my - r),
+            ])
+        else:
+            radius = standards.wall_clearance_mm
+            dead_zones.append([
+                (mx - radius, my - radius),
+                (mx + radius, my - radius),
+                (mx + radius, my + radius),
+                (mx - radius, my + radius),
+            ])
     return dead_zones
 
 

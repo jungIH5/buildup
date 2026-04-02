@@ -131,12 +131,21 @@ async def run_pipeline(
 
     # Agent 3
     try:
+        # 비상구 좌표 추출 (check_emergency_path 활성화)
+        emergency_exits = [
+            (eq.position_mm[0], eq.position_mm[1])
+            for eq in floor.equipment_detected
+            if eq.equipment_type in ("exit", "emergency_exit") and eq.position_mm is not None
+        ]
+
         result: LayoutResult = await run_agent3(
             floor=floor,
             standards=standards,
             constraints=constraints,
             furniture_sizes=FURNITURE_SIZES,
             client=client,
+            emergency_exits=emergency_exits if emergency_exits else None,
+            relationships=standards.relationships if standards.relationships else None,
         )
     except Exception as e:
         import traceback
@@ -173,12 +182,12 @@ async def agent2_review(
 ):
     """
     Agent 2 결과만 반환 (사용자 확인 단계용).
-    Dead Zone + reference_points + eligible_objects 시각화 데이터 제공.
+    Dead Zone + reference_points (zone_label 포함) + eligible_objects 시각화 데이터 제공.
     """
-    from ..core.schemas import BrandStandards
+    from core.schemas import BrandStandards
     client = request.app.state.anthropic
     image_bytes = await floor_plan.read()
-    standards = BrandStandards()  # 기본값으로 Agent 2 실행
+    standards = BrandStandards()
 
     markings = None
     if user_markings:
@@ -187,7 +196,27 @@ async def agent2_review(
         except json.JSONDecodeError:
             pass
 
-    floor, constraints = await run_agent2(image_bytes, standards, markings, client)
+    # PDF이면 PNG 변환
+    page_size_mm = None
+    original_pdf_bytes = None
+    if floor_plan.content_type == "application/pdf" or floor_plan.filename.lower().endswith(".pdf"):
+        import fitz
+        original_pdf_bytes = image_bytes
+        doc = fitz.open(stream=image_bytes, filetype="pdf")
+        page = doc.load_page(0)
+        page_size_mm = (page.rect.width * 25.4 / 72, page.rect.height * 25.4 / 72)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        image_bytes = pix.tobytes("png")
+        doc.close()
+
+    floor, constraints, _ = await run_agent2(
+        image_bytes=image_bytes,
+        standards=standards,
+        user_marked_equipment=markings,
+        client=client,
+        page_size_mm=page_size_mm,
+        pdf_bytes=original_pdf_bytes,
+    )
 
     return JSONResponse(content={
         "room_polygon_mm": floor.room_polygon_mm,

@@ -30,6 +30,9 @@ SYSTEM_PROMPT = """당신은 공간 배치 전문가입니다.
 
 PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치 의도를 결정하세요.
 
+공간 기준점 (zone_label로 위치 특성 파악):
+{reference_points}
+
 공간 제약:
 {constraints}
 
@@ -38,6 +41,8 @@ PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치
 
 브랜드 기준:
 {brand_standards}
+
+{relationships_section}
 
 {feedback_section}
 
@@ -64,8 +69,16 @@ FEEDBACK_TEMPLATE = """
 이미 배치 성공한 오브젝트:
 {placed_objects}
 
-실패한 오브젝트에 대해 다른 reference_point나 direction을 시도하세요.
+대안 기준점 (실패한 오브젝트에 시도 가능):
+{alternative_refs}
+
+실패한 오브젝트에 대해 대안 기준점이나 다른 direction을 시도하세요.
 이미 성공한 오브젝트는 다시 포함하지 마세요.
+"""
+
+RELATIONSHIPS_TEMPLATE = """
+브랜드 캐릭터/오브젝트 간 관계 제약 (반드시 준수):
+{relationships}
 """
 
 
@@ -76,6 +89,7 @@ async def run_agent3(
     furniture_sizes: dict[str, tuple[float, float]],
     client: anthropic.AsyncAnthropic,
     emergency_exits: list[tuple[float, float]] | None = None,
+    relationships: list[dict] | None = None,
 ) -> LayoutResult:
     """
     Agent 3 메인 진입점.
@@ -89,10 +103,35 @@ async def run_agent3(
     all_violations: list = []
     remaining_objects = list(floor.eligible_objects)
 
+    # zone_label 포함 기준점 요약 (Agent 3에게 공간 깊이 정보 전달)
+    ref_summary = [
+        {
+            "name": rp.name,
+            "zone_label": rp.zone_label or "unknown",
+            "walk_distance_mm": rp.walk_distance_mm,
+            "facing": rp.facing,
+        }
+        for rp in floor.reference_points
+    ]
+
+    # relationships 섹션
+    relationships_section = ""
+    if relationships:
+        relationships_section = RELATIONSHIPS_TEMPLATE.format(
+            relationships=json.dumps(relationships, ensure_ascii=False, indent=2)
+        )
+
     for attempt in range(MAX_RETRIES + 1):
-        # 프롬프트 구성
+        # 피드백 섹션
         feedback_section = ""
         if attempt > 0 and all_failed:
+            # 대안 기준점: 실패한 오브젝트가 시도한 기준점 외 나머지
+            used_refs = {f["reference_point"] for f in all_failed}
+            alt_refs = [
+                {"name": rp.name, "zone_label": rp.zone_label or "unknown"}
+                for rp in floor.reference_points
+                if rp.name not in used_refs
+            ]
             feedback_section = FEEDBACK_TEMPLATE.format(
                 failed_objects=json.dumps(all_failed, ensure_ascii=False, indent=2),
                 placed_objects=json.dumps(
@@ -100,9 +139,11 @@ async def run_agent3(
                      for p in all_placed],
                     ensure_ascii=False, indent=2,
                 ),
+                alternative_refs=json.dumps(alt_refs, ensure_ascii=False, indent=2),
             )
 
         prompt = PLACEMENT_PROMPT_TEMPLATE.format(
+            reference_points=json.dumps(ref_summary, ensure_ascii=False, indent=2),
             constraints=json.dumps(constraints, ensure_ascii=False, indent=2),
             eligible_objects=json.dumps(remaining_objects, ensure_ascii=False),
             brand_standards=json.dumps({
@@ -112,6 +153,7 @@ async def run_agent3(
                 "main_corridor_min_mm": standards.main_corridor_min_mm,
                 "wall_clearance_mm": standards.wall_clearance_mm,
             }, ensure_ascii=False, indent=2),
+            relationships_section=relationships_section,
             feedback_section=feedback_section,
         )
 
