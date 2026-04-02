@@ -6,6 +6,7 @@ interface PlacedObject {
   position_mm: [number, number];
   rotation_deg: number;
   bbox_mm: [number, number];
+  height_mm: number;
   reference_point: string;
   placed_because: string;
 }

@@ -37,6 +37,9 @@ class BrandStandards(BaseModel):
     emergency_path_min_mm: float = Field(default=1200, ge=900, le=3000)
     wall_clearance_mm: float = Field(default=300, ge=100, le=1000)
 
+    # 오브젝트별 실제 높이 (mm). 메뉴얼에서 추출, 없으면 코드 기본값 사용
+    furniture_heights_mm: dict[str, float] = Field(default_factory=dict)
+
     confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     source: Literal["메뉴얼 추출", "기본값", "사용자 입력"] = "기본값"
 
@@ -139,7 +142,8 @@ class PlacedObject(BaseModel):
     object_type: str
     position_mm: tuple[float, float]
     rotation_deg: float = 0.0
-    bbox_mm: tuple[float, float]       # width, height
+    bbox_mm: tuple[float, float]       # 평면 footprint: (width_mm, depth_mm)
+    height_mm: float = 1500.0          # 3D 실제 높이 (메뉴얼 추출 or 기본값)
     reference_point: str
     placed_because: str
 

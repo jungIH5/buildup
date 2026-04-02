@@ -13,7 +13,7 @@ from typing import Optional
 from agents.agent1_brand import run_agent1
 from agents.agent2_floor import run_agent2
 from agents.agent3_layout import run_agent3
-from core.schemas import LayoutResult
+from core.schemas import LayoutResult, FloorAnalysis, BrandStandards
 
 router = APIRouter()
 
@@ -38,6 +38,7 @@ async def run_pipeline(
     brand_manual: Optional[UploadFile] = File(None, description="브랜드 메뉴얼 PDF (선택사항)"),
     floor_plan: Optional[UploadFile] = File(None, description="도면 이미지/PDF (선택사항)"),
     user_markings: Optional[str] = Form(None, description="사용자 마킹 JSON 문자열"),
+    user_requirements: Optional[str] = Form(None, description="사용자 배치 요구사항 자유 텍스트"),
 ):
     """
     Agent 1 → Agent 2 → Agent 3 전체 파이프라인 실행.
@@ -146,6 +147,7 @@ async def run_pipeline(
             client=client,
             emergency_exits=emergency_exits if emergency_exits else None,
             relationships=standards.relationships if standards.relationships else None,
+            user_requirements=user_requirements,
         )
     except Exception as e:
         import traceback
@@ -171,6 +173,70 @@ async def run_pipeline(
         "image_size_px": image_meta.get("image_size_px"),
         "room_bbox_px": image_meta.get("room_bbox_px"),
         "floor_plan_png": floor_png_b64,
+        # Agent 3 재실행용 캐시 (Agent 1·2 결과 재활용)
+        "_cache": {
+            "floor": floor.model_dump(),
+            "standards": standards.model_dump(),
+            "constraints": constraints,
+            "emergency_exits": emergency_exits,
+            "user_requirements": user_requirements,
+        },
+    })
+
+
+class LayoutOnlyRequest(BaseModel):
+    floor: dict
+    standards: dict
+    constraints: dict
+    emergency_exits: list[list[float]] | None = None
+    user_requirements: str | None = None
+
+
+@router.post("/layout_only")
+async def layout_only(request: Request, body: LayoutOnlyRequest):
+    """
+    Agent 3만 재실행. Agent 1·2 결과(floor, standards)를 캐시에서 받아 배치만 다시 생성.
+    """
+    client = request.app.state.anthropic
+
+    try:
+        floor = FloorAnalysis(**body.floor)
+        standards = BrandStandards(**body.standards)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"캐시 데이터 파싱 실패: {e}")
+
+    emergency_exits = (
+        [(pos[0], pos[1]) for pos in body.emergency_exits]
+        if body.emergency_exits else None
+    )
+
+    try:
+        result: LayoutResult = await run_agent3(
+            floor=floor,
+            standards=standards,
+            constraints=body.constraints,
+            furniture_sizes=FURNITURE_SIZES,
+            client=client,
+            emergency_exits=emergency_exits,
+            relationships=standards.relationships if standards.relationships else None,
+            user_requirements=body.user_requirements,
+        )
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Agent 3 재실행 실패: {e}")
+
+    return JSONResponse(content={
+        "placed": [p.model_dump() for p in result.placed],
+        "failed": result.failed,
+        "violations": [v.model_dump() for v in result.violations],
+        "glb_blocked": result.glb_blocked,
+        "disclaimer_items": result.disclaimer_items,
+        "summary": {
+            "total_requested": len(floor.eligible_objects),
+            "total_placed": len(result.placed),
+            "total_failed": len(result.failed),
+            "has_blocking_violation": result.glb_blocked,
+        },
     })
 
 

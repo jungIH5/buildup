@@ -30,13 +30,14 @@ SYSTEM_PROMPT = """당신은 공간 배치 전문가입니다.
 
 PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치 의도를 결정하세요.
 
+{user_requirements_section}
 공간 기준점 (zone_label로 위치 특성 파악):
 {reference_points}
 
 공간 제약:
 {constraints}
 
-배치 가능 오브젝트:
+배치 가능 오브젝트 (수량 포함):
 {eligible_objects}
 
 브랜드 기준:
@@ -60,6 +61,16 @@ PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치
   ]
 }}
 ```
+"""
+
+USER_REQUIREMENTS_TEMPLATE = """★ 사용자 요구사항 (최우선 반영):
+{requirements}
+
+위 요구사항을 반드시 우선적으로 반영하세요.
+- 수량이 명시된 경우: 해당 수량만큼 같은 object_type을 여러 번 출력하세요.
+- 위치가 명시된 경우: 가장 적합한 reference_point와 direction을 선택하세요.
+- 요구사항에 없는 오브젝트는 브랜드 기준과 공간 제약에 따라 자유롭게 배치하세요.
+
 """
 
 FEEDBACK_TEMPLATE = """
@@ -90,6 +101,7 @@ async def run_agent3(
     client: anthropic.AsyncAnthropic,
     emergency_exits: list[tuple[float, float]] | None = None,
     relationships: list[dict] | None = None,
+    user_requirements: str | None = None,
 ) -> LayoutResult:
     """
     Agent 3 메인 진입점.
@@ -101,7 +113,51 @@ async def run_agent3(
     all_placed_polys: list[Polygon] = []  # 라운드 간 충돌 체크용
     all_failed: list = []
     all_violations: list = []
-    remaining_objects = list(floor.eligible_objects)
+
+    # ── 사용자 요구사항 파싱 ──
+    # 기본 eligible_objects는 항상 유지. 요구사항은 수량만 조정.
+    # 예: "상품진열대 8개" → product_display 기본 1개를 8개로 늘림 (다른 오브젝트 유지)
+    import re
+    user_requirements_section = ""
+
+    # 기본 수량: eligible_objects의 각 타입은 기본 1개
+    base_counts: dict[str, int] = {}
+    for obj in floor.eligible_objects:
+        base_counts[obj] = base_counts.get(obj, 0) + 1
+
+    qty_overrides: dict[str, int] = {}
+    if user_requirements and user_requirements.strip():
+        user_requirements_section = USER_REQUIREMENTS_TEMPLATE.format(
+            requirements=user_requirements.strip()
+        )
+        qty_patterns = [
+            (r'product_display[를을]?\s*(\d+)개', 'product_display'),
+            (r'상품\s*진열대[를을]?\s*(\d+)개', 'product_display'),
+            (r'character_bbox[를을]?\s*(\d+)개', 'character_bbox'),
+            (r'캐릭터\s*조형물?[를을]?\s*(\d+)개', 'character_bbox'),
+            (r'photo_zone[를을]?\s*(\d+)개', 'photo_zone'),
+            (r'포토\s*존?[를을]?\s*(\d+)개', 'photo_zone'),
+            (r'banner_stand[를을]?\s*(\d+)개', 'banner_stand'),
+            (r'배너\s*스탠드?[를을]?\s*(\d+)개', 'banner_stand'),
+            (r'shelf_rental[를을]?\s*(\d+)개', 'shelf_rental'),
+            (r'렌탈?\s*선반[를을]?\s*(\d+)개', 'shelf_rental'),
+        ]
+        for pattern, obj_type in qty_patterns:
+            m = re.search(pattern, user_requirements, re.IGNORECASE)
+            if m:
+                qty_overrides[obj_type] = int(m.group(1))
+
+    # 최종 수량 결정: 요구사항 수량이 기본보다 크면 그 값으로, 아니면 기본값 유지
+    final_counts = dict(base_counts)
+    for obj_type, qty in qty_overrides.items():
+        final_counts[obj_type] = max(final_counts.get(obj_type, 0), qty)
+
+    # 기본 오브젝트를 먼저, 추가 수량을 뒤에 붙임 (priority 정렬로 기본이 먼저 배치됨)
+    expanded_objects: list[str] = []
+    for obj_type, count in final_counts.items():
+        expanded_objects.extend([obj_type] * count)
+
+    remaining_objects = expanded_objects
 
     # zone_label 포함 기준점 요약 (Agent 3에게 공간 깊이 정보 전달)
     ref_summary = [
@@ -143,6 +199,7 @@ async def run_agent3(
             )
 
         prompt = PLACEMENT_PROMPT_TEMPLATE.format(
+            user_requirements_section=user_requirements_section,
             reference_points=json.dumps(ref_summary, ensure_ascii=False, indent=2),
             constraints=json.dumps(constraints, ensure_ascii=False, indent=2),
             eligible_objects=json.dumps(remaining_objects, ensure_ascii=False),
@@ -221,7 +278,7 @@ async def _call_with_circuit_breaker(
     for i in range(max_retries):
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=512,
+            max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )

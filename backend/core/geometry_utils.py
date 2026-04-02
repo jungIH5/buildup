@@ -13,6 +13,15 @@ DEFAULTS = {
     "clearspace_mm": 500,
 }
 
+# 오브젝트 기본 높이 (메뉴얼에서 추출 못한 경우 사용)
+DEFAULT_FURNITURE_HEIGHTS: dict[str, float] = {
+    "character_bbox":  1800.0,  # 캐릭터 조형물 ~1.8m
+    "photo_zone":      2500.0,  # 포토존 배경판 ~2.5m
+    "banner_stand":    2200.0,  # 배너 스탠드 ~2.2m
+    "shelf_rental":    1800.0,  # 렌탈 선반 ~1.8m
+    "product_display": 1500.0,  # 상품 진열대 ~1.5m
+}
+
 
 def mm_to_unit(mm: float) -> float:
     """mm 값을 내부 unit 값으로 변환"""

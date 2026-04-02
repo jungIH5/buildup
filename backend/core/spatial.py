@@ -22,11 +22,15 @@ from core.violations import (
     check_emergency_path,
     aggregate_violations,
 )
+from core.geometry_utils import DEFAULT_FURNITURE_HEIGHTS
 
 # 코드 레벨 위치 조정 파라미터
 STEP_MM: float = 50.0    # 한 번 밀 때 이동 거리
-MAX_STEPS: int = 20       # 최대 시도 횟수
+MAX_STEPS: int = 30       # 최대 시도 횟수 (수량 많을 때 더 넓은 범위 탐색)
 CORRIDOR_GRID_MM: float = 150.0   # 통로 체크 격자 크기
+
+# 사람 1명 통과 최소 통행폭 (브랜드 clearspace와 별개)
+MIN_ACCESS_GAP_MM: float = 600.0
 
 
 def _build_walkability_graph(
@@ -141,6 +145,40 @@ def make_object_polygon(
     return rect
 
 
+def _is_accessible(
+    obj_poly: Polygon,
+    placed_polys: list[Polygon],
+    room_poly: Polygon,
+    clearspace_mm: float,
+) -> bool:
+    """
+    오브젝트가 사람이 접근 가능한지 확인.
+    - 4개 면 중 최소 1개 이상이 clearspace_mm 만큼 열려 있어야 함
+    - 열린 면: 해당 방향으로 clearspace_mm 확장했을 때 다른 오브젝트나 벽과 겹치지 않는 영역
+    """
+    minx, miny, maxx, maxy = obj_poly.bounds
+    half_cs = clearspace_mm
+
+    # 4방향 접근 통로 후보 (오브젝트 옆에 clearspace 폭의 복도)
+    side_rects = [
+        box(minx, miny - half_cs, maxx, miny),           # 남쪽
+        box(minx, maxy, maxx, maxy + half_cs),            # 북쪽
+        box(minx - half_cs, miny, minx, maxy),            # 서쪽
+        box(maxx, miny, maxx + half_cs, maxy),            # 동쪽
+    ]
+
+    obstacles = placed_polys  # 이미 배치된 오브젝트
+    for side in side_rects:
+        # 방 안에 있고, 다른 오브젝트와 겹치지 않으면 접근 가능
+        if not room_poly.contains(side):
+            continue
+        if any(side.intersects(p) for p in obstacles):
+            continue
+        return True  # 최소 한 면은 열려 있음
+
+    return False
+
+
 def try_place_object(
     cx: float, cy: float,
     width_mm: float, height_mm: float,
@@ -150,15 +188,20 @@ def try_place_object(
     placed_polys: list[Polygon],
     corridor_graph: nx.Graph | None = None,
     entrance_pos: tuple[float, float] | None = None,
+    clearspace_mm: float = MIN_ACCESS_GAP_MM,
 ) -> tuple[Polygon | None, float, float]:
     """
     주어진 위치에 오브젝트 배치 시도.
     충돌 시 STEP_MM 씩 밀어서 MAX_STEPS 회까지 재시도.
-    corridor_graph + entrance_pos 제공 시 NetworkX 통로 연결성도 검사.
+    - clearspace_mm: 접근성 체크에 쓸 최소 통행폭 (브랜드 clearspace가 아닌 사람 통행 기준)
+    - 오브젝트 간 직접 충돌(0mm)은 항상 체크
+    - 접근성: 최소 1개 면 이상 MIN_ACCESS_GAP_MM 이상 열려있어야 함
     성공하면 (polygon, cx, cy), 실패하면 (None, cx, cy).
     """
     directions = [(1, 0), (0, 1), (-1, 0), (0, -1),
                   (1, 1), (-1, 1), (1, -1), (-1, -1)]
+
+    access_gap = max(clearspace_mm, MIN_ACCESS_GAP_MM)
 
     for step in range(MAX_STEPS + 1):
         for dx_sign, dy_sign in directions:
@@ -174,7 +217,12 @@ def try_place_object(
                 continue
             if any(obj_poly.intersects(dz) for dz in dead_zones):
                 continue
+            # 오브젝트 직접 충돌 체크 (0mm 이격)
             if any(obj_poly.intersects(p) for p in placed_polys):
+                continue
+
+            # 접근성 체크: 최소 1개 면이 access_gap 이상 열려야 함
+            if not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
                 continue
 
             # NetworkX 통로 연결성 체크 (이미 배치된 오브젝트 포함)
@@ -232,7 +280,12 @@ def compute_layout(
             })
             continue
 
-        width_mm, height_mm = furniture_sizes[intent.object_type]
+        width_mm, depth_mm = furniture_sizes[intent.object_type]
+        # 높이: 브랜드 메뉴얼 추출값 → 기본값 순서로 적용
+        height_mm = (
+            standards.furniture_heights_mm.get(intent.object_type)
+            or DEFAULT_FURNITURE_HEIGHTS.get(intent.object_type, 1500.0)
+        )
 
         # 기준점 좌표 조회
         try:
@@ -248,9 +301,10 @@ def compute_layout(
         cx, cy = ref_pos
         rotation_deg = _direction_to_rotation(intent.direction)
 
-        # 배치 시도 (Shapely 충돌 + NetworkX 통로 연결성 체크)
+        # 배치 시도 (충돌 + 접근성 + NetworkX 통로 연결성 체크)
+        # clearspace_mm: 사람 통행 최소폭(600mm) 기준 — 브랜드 clearspace와 별개
         obj_poly, final_cx, final_cy = try_place_object(
-            cx, cy, width_mm, height_mm, rotation_deg,
+            cx, cy, width_mm, depth_mm, rotation_deg,
             room_poly, dead_zones, placed_polys,
             corridor_graph=corridor_graph,
             entrance_pos=entrance_pos,
@@ -292,7 +346,8 @@ def compute_layout(
             object_type=intent.object_type,
             position_mm=(final_cx, final_cy),
             rotation_deg=rotation_deg,
-            bbox_mm=(width_mm, height_mm),
+            bbox_mm=(width_mm, depth_mm),
+            height_mm=height_mm,
             reference_point=intent.reference_point,
             placed_because=intent.placed_because,
         ))

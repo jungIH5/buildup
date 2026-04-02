@@ -14,6 +14,7 @@ import {
   Trash2,
   PlusSquare,
   Undo2,
+  RefreshCw,
 } from 'lucide-react';
 import './globals.css';
 
@@ -29,6 +30,7 @@ interface Placement {
   position_mm: [number, number];
   rotation_deg: number;
   bbox_mm: [number, number];
+  height_mm: number;
   reference_point: string;
   placed_because: string;
 }
@@ -52,6 +54,7 @@ interface PipelineResult {
   image_size_px?: [number, number];
   room_bbox_px?: [number, number, number, number];
   floor_plan_png?: string;
+  _cache?: { floor: unknown; standards: unknown; constraints: unknown; emergency_exits: unknown };
 }
 
 const OBJECT_NAMES: Record<string, string> = {
@@ -84,8 +87,10 @@ const App: React.FC = () => {
   const [brandManual, setBrandManual]           = useState<File | null>(null);
   const [floorPlan, setFloorPlan]               = useState<File | null>(null);
   const [floorPlanUrl, setFloorPlanUrl]         = useState<string | null>(null);
+  const [userRequirements, setUserRequirements] = useState('');
   const [isProcessing, setIsProcessing]         = useState(false);
   const [result, setResult]                     = useState<PipelineResult | null>(null);
+  const layoutCache = useRef<PipelineResult['_cache'] | null>(null);
 
   // Local editable state (drag moves update these without re-running pipeline)
   const [localPlaced, setLocalPlaced]           = useState<Placement[]>([]);
@@ -93,6 +98,36 @@ const App: React.FC = () => {
   const [selectedObjectIndex, setSelectedObjectIndex] = useState<number | null>(null);
   const [selectedWallId, setSelectedWallId]     = useState<string | null>(null);
   const [viewMode, setViewMode]                 = useState<'3d' | '2d'>('3d');
+
+  // ── Agent 3만 재실행 (Agent 1·2 캐시 재활용) ──
+  const handleRegenerate = async () => {
+    if (!layoutCache.current) {
+      // 캐시 없으면 전체 파이프라인 재실행
+      handleProcess();
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      const response = await axios.post('http://localhost:8000/api/pipeline/layout_only', layoutCache.current);
+      setResult(prev => prev ? {
+        ...prev,
+        placed: response.data.placed,
+        failed: response.data.failed,
+        violations: response.data.violations,
+        glb_blocked: response.data.glb_blocked,
+        disclaimer_items: response.data.disclaimer_items,
+        summary: response.data.summary,
+      } : prev);
+      setSelectedObjectIndex(null);
+      setSelectedWallId(null);
+      undoStack.current = [];
+    } catch (error) {
+      console.error('Regenerate failed:', error);
+      alert('재생성 중 오류가 발생했습니다.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
 
   // ── Undo stack ──
   type Snapshot = { placed: Placement[]; walls: Wall[] };
@@ -118,12 +153,17 @@ const App: React.FC = () => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
         e.preventDefault();
-        handleUndo();
+        // handleUndo only touches refs + setters — safe to call from closure
+        if (undoStack.current.length === 0) return;
+        const snap = undoStack.current[undoStack.current.length - 1];
+        undoStack.current = undoStack.current.slice(0, -1);
+        setLocalPlaced(snap.placed);
+        setWalls(snap.walls);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  });
+  }, []);
 
   // Sync localPlaced when result updates
   useEffect(() => {
@@ -139,10 +179,12 @@ const App: React.FC = () => {
     const formData = new FormData();
     if (brandManual) formData.append('brand_manual', brandManual);
     if (floorPlan)   formData.append('floor_plan', floorPlan);
+    if (userRequirements.trim()) formData.append('user_requirements', userRequirements.trim());
 
     try {
       const response = await axios.post('http://localhost:8000/api/pipeline/run', formData);
       setResult(response.data);
+      layoutCache.current = response.data._cache ?? null;
       setWalls([]);
       setSelectedObjectIndex(null);
       setSelectedWallId(null);
@@ -197,10 +239,26 @@ const App: React.FC = () => {
       cx = poly.reduce((s, p) => s + p[0], 0) / poly.length;
       cz = poly.reduce((s, p) => s + p[1], 0) / poly.length;
     }
+    // 기존 가벽 수에 따라 위치를 엇갈려서 겹치지 않게 생성
+    const step = 700; // 700mm 간격
+    const count = walls.length;
+    const col = count % 3;       // 0,1,2 → x축 방향
+    const row = Math.floor(count / 3); // 3개마다 z축으로 한 줄 아래
+    const offsetX = (col - 1) * step;  // -700, 0, +700
+    const offsetZ = row * step;
+
     const id = newWallId();
     setWalls(prev => {
       pushHistory(localPlaced, prev);
-      return [...prev, { id, x: cx, z: cz, rotation: 0, length, height: 2500, thickness: 100 }];
+      return [...prev, {
+        id,
+        x: cx + offsetX,
+        z: cz + offsetZ,
+        rotation: 0,
+        length,
+        height: 2500,
+        thickness: 100,
+      }];
     });
     setSelectedWallId(id);
   };
@@ -264,6 +322,27 @@ const App: React.FC = () => {
               </label>
             </div>
 
+            {/* 요구사항 입력 */}
+            <div className="md:col-span-2 glass-card p-6">
+              <h3 className="text-base font-bold mb-2 flex items-center gap-2">
+                <Layout size={18} className="text-accent" /> 배치 요구사항 입력
+                <span className="ml-2 text-xs text-text-muted font-normal">(선택사항)</span>
+              </h3>
+              <p className="text-xs text-text-muted mb-3">
+                원하는 배치 조건을 자유롭게 입력하세요.<br/>
+                예) <span className="text-accent">상품진열대를 8개 배치해주세요. 벽에 4개, 중앙에 4개.</span>
+                &nbsp;/&nbsp;
+                <span className="text-accent">포토존은 입구 정면에, 캐릭터 조형물은 중앙에 배치해주세요.</span>
+              </p>
+              <textarea
+                className="w-full bg-black/20 border border-border rounded-xl p-3 text-sm text-text-main placeholder-text-muted resize-none focus:outline-none focus:border-accent/60 transition-colors"
+                rows={3}
+                placeholder="배치 요구사항을 입력하세요..."
+                value={userRequirements}
+                onChange={(e) => setUserRequirements(e.target.value)}
+              />
+            </div>
+
             <div className="md:col-span-2 flex flex-col items-center mt-4 gap-2">
               <button
                 className="btn-primary"
@@ -292,6 +371,14 @@ const App: React.FC = () => {
                   <Package className="text-primary" /> 배치 레이아웃
                 </h3>
                 <div className="flex gap-2 items-center">
+                  <button
+                    onClick={handleRegenerate}
+                    disabled={isProcessing}
+                    title="배치 재생성 (도면·메뉴얼 재분석 없이 배치만 다시 생성)"
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-border text-xs font-bold text-text-muted hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <RefreshCw size={14} className={isProcessing ? 'animate-spin' : ''} /> 재생성
+                  </button>
                   <button
                     onClick={handleUndo}
                     disabled={undoStack.current.length === 0}
@@ -472,7 +559,7 @@ const App: React.FC = () => {
                           {isSelected && <span className="ml-auto text-yellow-400 text-xs">선택됨</span>}
                         </div>
                         <div className="text-xs text-text-muted mt-1 pl-5">
-                          기준점: {p.reference_point} · {p.bbox_mm[0]}×{p.bbox_mm[1]}mm
+                          기준점: {p.reference_point} · {p.bbox_mm[0]}×{p.bbox_mm[1]}mm (H {p.height_mm}mm)
                         </div>
                         {isSelected && (
                           <div className="text-xs text-text-muted mt-1 pl-5 leading-relaxed">

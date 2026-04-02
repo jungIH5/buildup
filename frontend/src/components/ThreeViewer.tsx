@@ -7,6 +7,7 @@ export interface PlacedObject {
   position_mm: [number, number];
   rotation_deg: number;
   bbox_mm: [number, number];
+  height_mm: number;
   reference_point: string;
   placed_because: string;
 }
@@ -61,14 +62,16 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const wallMeshes    = useRef<THREE.Mesh[]>([]);
 
   // Callback refs (always current in event closures)
-  const cbObjectClick = useRef(onObjectClick);
-  const cbWallClick   = useRef(onWallClick);
-  const cbObjectMove  = useRef(onObjectMove);
-  const cbWallMove    = useRef(onWallMove);
-  useEffect(() => { cbObjectClick.current = onObjectClick; }, [onObjectClick]);
-  useEffect(() => { cbWallClick.current   = onWallClick;   }, [onWallClick]);
-  useEffect(() => { cbObjectMove.current  = onObjectMove;  }, [onObjectMove]);
-  useEffect(() => { cbWallMove.current    = onWallMove;    }, [onWallMove]);
+  const cbObjectClick    = useRef(onObjectClick);
+  const cbWallClick      = useRef(onWallClick);
+  const cbObjectMove     = useRef(onObjectMove);
+  const cbWallMove       = useRef(onWallMove);
+  const selectedWallIdRef = useRef(selectedWallId);
+  useEffect(() => { cbObjectClick.current     = onObjectClick;  }, [onObjectClick]);
+  useEffect(() => { cbWallClick.current       = onWallClick;    }, [onWallClick]);
+  useEffect(() => { cbObjectMove.current      = onObjectMove;   }, [onObjectMove]);
+  useEffect(() => { cbWallMove.current        = onWallMove;     }, [onWallMove]);
+  useEffect(() => { selectedWallIdRef.current = selectedWallId; }, [selectedWallId]);
 
   // ── Highlight: placed objects ──
   useEffect(() => {
@@ -204,7 +207,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     // ── AI 배치 오브젝트 ──
     placedObjects.forEach((obj, i) => {
-      const [w,d] = obj.bbox_mm, h = 1500;
+      const [w,d] = obj.bbox_mm, h = obj.height_mm ?? 1500;
       const geo = new THREE.BoxGeometry(w,h,d);
       const isSel = i === selectedIndex;
       const mat = new THREE.MeshStandardMaterial({
@@ -275,6 +278,13 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       downPos = { x: e.clientX, y: e.clientY };
       const mesh = findDraggable(e);
       if (!mesh) return;
+
+      // 가벽은 선택된 것만 드래그 가능 — 겹쳐있을 때 의도치 않은 이동 방지
+      if (mesh.userData.type === 'wall' && mesh.userData.wallId !== selectedWallIdRef.current) {
+        // 드래그 시작하지 않음 — pointerup에서 클릭으로 처리
+        downPos = { x: e.clientX, y: e.clientY };
+        return;
+      }
 
       getMouseNDC(e);
       raycaster.setFromCamera(mouse, camera);

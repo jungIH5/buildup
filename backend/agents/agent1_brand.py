@@ -29,6 +29,13 @@ EXTRACTION_PROMPT = """다음 브랜드 메뉴얼 PDF를 분석하여 아래 JSO
   "main_corridor_min_mm": <숫자 또는 null>,
   "emergency_path_min_mm": <숫자 또는 null>,
   "wall_clearance_mm": <숫자 또는 null>,
+  "furniture_heights_mm": {
+    "character_bbox": <캐릭터 조형물 높이(mm) 또는 null>,
+    "shelf_rental": <렌탈 선반 높이(mm) 또는 null>,
+    "photo_zone": <포토존 배경판 높이(mm) 또는 null>,
+    "banner_stand": <배너 스탠드 높이(mm) 또는 null>,
+    "product_display": <상품 진열대 높이(mm) 또는 null>
+  },
   "confidence": "high" | "medium" | "low",
   "source": "메뉴얼 추출"
 }
@@ -38,6 +45,7 @@ EXTRACTION_PROMPT = """다음 브랜드 메뉴얼 PDF를 분석하여 아래 JSO
 - 추측 금지 — 명확히 기재된 값만 추출
 - 단위가 cm/m면 mm로 변환
 - "넉넉하게", "적당히" 같은 표현은 null
+- furniture_heights_mm: 메뉴얼에 조형물·전시물·구조물의 높이(H) 수치가 명시된 경우에만 기재. null이면 시스템 기본값 사용
 - confidence: 명확한 수치 → high, 서술형 → medium, 불명확 → low
 """
 
@@ -127,6 +135,12 @@ async def run_agent1(pdf_bytes: bytes, client: anthropic.AsyncAnthropic) -> Bran
     for key, val in data.items():
         if val is not None:
             merged[key] = val
+
+    # furniture_heights_mm: dict 내부의 null 값 키 제거
+    if "furniture_heights_mm" in merged and isinstance(merged["furniture_heights_mm"], dict):
+        merged["furniture_heights_mm"] = {
+            k: v for k, v in merged["furniture_heights_mm"].items() if v is not None
+        }
 
     merged.setdefault("source", "메뉴얼 추출")
     merged.setdefault("confidence", "medium")
