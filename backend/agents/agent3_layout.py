@@ -26,6 +26,8 @@ SYSTEM_PROMPT = """당신은 공간 배치 전문가입니다.
 1. 좌표(x, y), mm 숫자 값, 픽셀 값을 출력하지 마세요.
 2. reference_point 이름(예: entrance, north_wall_mid)으로만 위치를 지시하세요.
 3. 반드시 JSON 형식으로만 응답하세요.
+4. 오브젝트를 공간 전체에 고르게 분산하세요 — 동일 reference_point에 최대 2개까지만 배치.
+5. entrance_zone / mid_zone / deep_zone을 균형 있게 활용해 한쪽으로 몰리지 않게 하세요.
 """
 
 PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치 의도를 결정하세요.
@@ -44,6 +46,11 @@ PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치
 {brand_standards}
 
 {relationships_section}
+
+분산 배치 원칙 (필수 준수):
+- 같은 reference_point에 최대 2개까지만 배치
+- entrance_zone·mid_zone·deep_zone을 균형 있게 사용
+- 동선이 확보되도록 오브젝트 간 여백 고려
 
 {feedback_section}
 
@@ -215,7 +222,7 @@ async def run_agent3(
         )
 
         # LLM 호출 + Circuit Breaker 검증
-        layout_plan = await _call_with_circuit_breaker(prompt, client)
+        layout_plan = await _call_with_circuit_breaker(prompt, client, n_objects=len(remaining_objects))
         if layout_plan is None:
             for obj in remaining_objects:
                 all_failed.append({
@@ -269,16 +276,19 @@ async def run_agent3(
 async def _call_with_circuit_breaker(
     prompt: str,
     client: anthropic.AsyncAnthropic,
-    max_retries: int = 3,
+    max_retries: int = 2,
+    n_objects: int = 10,
 ) -> LayoutPlan | None:
     """
     LLM 호출 + Pydantic Circuit Breaker.
-    최대 3회 재시도 후 None 반환.
+    최대 2회 재시도 후 None 반환.
     """
+    # 오브젝트 1개당 약 180 토큰 + 기본 여유 400
+    output_tokens = max(1500, n_objects * 180 + 400)
     for i in range(max_retries):
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
+            max_tokens=output_tokens,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )

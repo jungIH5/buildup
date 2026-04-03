@@ -11,7 +11,6 @@ import base64
 import json
 import math
 import re
-from typing import Optional
 import cv2
 import networkx as nx
 import numpy as np
@@ -292,85 +291,39 @@ def compute_scale(
 # 후반부: Dead Zone + reference_point
 # ─────────────────────────────────────────
 
-CONSTRAINT_SYSTEM = """당신은 공간 배치 제약 분석 전문가입니다.
-도면 분석 결과를 바탕으로 배치 제약 사항을 자연어로 설명합니다.
-좌표나 mm 숫자 값을 Agent 3에게 전달하지 마세요.
-"""
-
-CONSTRAINT_PROMPT_TEMPLATE = """다음 공간 분석 결과를 바탕으로 배치 제약 사항을 작성하세요.
-
-공간 정보:
-{space_info}
-
-브랜드 기준값:
-{brand_info}
-
-출력 형식 (JSON):
-```json
-{{
-  "natural_language_constraints": "배치 시 고려해야 할 제약 사항을 자연어로 서술",
-  "eligible_objects": ["배치 가능 오브젝트 코드명 목록"],
-  "priority_notes": "우선순위 고려사항"
-}}
-```
-
-규칙:
-- 좌표, 픽셀, mm 숫자 값 절대 포함 금지
-- reference_point 이름(entrance, north_wall_mid 등)으로만 위치 표현
-- eligible_objects는 Supabase furniture_standards 코드명 사용
-"""
-
-
-async def build_constraints(
+def build_constraints(
     floor_analysis: FloorAnalysis,
     standards: BrandStandards,
-    client: anthropic.AsyncAnthropic,
 ) -> dict:
-    """Agent 2 후반부: 자연어 제약 생성 (Agent 3 입력용)"""
-    space_info = {
-        "reference_points": [rp.model_dump() for rp in floor_analysis.reference_points],
+    """
+    Agent 2 후반부: 배치 제약 생성 (결정적 — LLM 호출 없음).
+    공간 분석 결과를 직접 구조화하여 Agent 3에 전달.
+    """
+    zone_summary: dict[str, list[str]] = {"entrance_zone": [], "mid_zone": [], "deep_zone": [], "unknown": []}
+    for rp in floor_analysis.reference_points:
+        zone = rp.zone_label or "unknown"
+        zone_summary.setdefault(zone, []).append(rp.name)
+
+    eq_types = [eq.equipment_type for eq in floor_analysis.equipment_detected]
+    has_exit = any(t in ("exit", "emergency_exit") for t in eq_types)
+
+    parts = [
+        f"설비 {len(floor_analysis.equipment_detected)}개 감지 (dead zone {len(floor_analysis.dead_zones_mm)}개 설정).",
+        f"clearspace {standards.clearspace_mm}mm, 복도 최소폭 {standards.main_corridor_min_mm}mm 유지.",
+    ]
+    if has_exit:
+        parts.append("비상구 인접 구역에 오브젝트 배치 금지.")
+    for zone, names in zone_summary.items():
+        if names and zone != "unknown":
+            parts.append(f"{zone}: {', '.join(names)}.")
+
+    parts.append("오브젝트를 entrance_zone·mid_zone·deep_zone에 고르게 분산 배치하세요.")
+
+    return {
+        "natural_language_constraints": " ".join(parts),
         "eligible_objects": floor_analysis.eligible_objects,
-        "equipment_count": len(floor_analysis.equipment_detected),
-        "dead_zone_count": len(floor_analysis.dead_zones_mm),
-        "disclaimer_count": len(floor_analysis.disclaimer_items),
+        "priority_notes": "캐릭터 조형물은 동선이 확보된 mid_zone 또는 deep_zone 우선. 배너·진열대는 벽 근처 배치 권장.",
     }
-    brand_info = {
-        "clearspace_mm": standards.clearspace_mm,
-        "character_orientation": standards.character_orientation,
-        "prohibited_material": standards.prohibited_material,
-        "main_corridor_min_mm": standards.main_corridor_min_mm,
-    }
-
-    prompt = CONSTRAINT_PROMPT_TEMPLATE.format(
-        space_info=json.dumps(space_info, ensure_ascii=False, indent=2),
-        brand_info=json.dumps(brand_info, ensure_ascii=False, indent=2),
-    )
-
-    response = await client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        system=CONSTRAINT_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    import logging
-    u = response.usage
-    logging.info(f"[Agent2/Constraints] input={u.input_tokens} output={u.output_tokens}")
-
-    raw = response.content[0].text.strip()
-    if "```json" in raw:
-        raw = raw.split("```json")[1].split("```")[0].strip()
-    elif "```" in raw:
-        raw = raw.split("```")[1].split("```")[0].strip()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {
-            "natural_language_constraints": "자동 제약 생성 실패. 기본 규칙 적용.",
-            "eligible_objects": floor_analysis.eligible_objects,
-            "priority_notes": "",
-        }
 
 
 # ─────────────────────────────────────────
@@ -527,7 +480,7 @@ async def run_agent2(
         disclaimer_items=disclaimers,
     )
 
-    constraints = await build_constraints(floor, standards, client)
+    constraints = build_constraints(floor, standards)
 
     image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
     return floor, constraints, image_meta

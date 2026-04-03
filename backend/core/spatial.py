@@ -32,6 +32,10 @@ CORRIDOR_GRID_MM: float = 150.0   # 통로 체크 격자 크기
 # 사람 1명 통과 최소 통행폭 (브랜드 clearspace와 별개)
 MIN_ACCESS_GAP_MM: float = 600.0
 
+# 분산 배치: 유효 후보 중 기존 오브젝트와 가장 멀리 떨어진 위치 선택
+DISPERSION_SEARCH_STEPS: int = 12  # 이 스텝까지는 후보 수집, 최고 분산 점수 선택
+MAX_CANDIDATES: int = 16           # 충분한 후보가 쌓이면 조기 종료
+
 
 def _build_walkability_graph(
     room_poly: Polygon,
@@ -98,6 +102,19 @@ def _corridor_ok(
     )
     component = nx.node_connected_component(G_temp, entrance_node)
     return len(component) / len(G_temp.nodes()) >= min_reachable_fraction
+
+
+def _min_placed_distance(cx: float, cy: float, placed_polys: list[Polygon]) -> float:
+    """기존 배치 오브젝트 중심까지의 최소 거리 (분산 점수)"""
+    if not placed_polys:
+        return float('inf')
+    return min(
+        math.sqrt(
+            (cx - (p.bounds[0] + p.bounds[2]) / 2) ** 2 +
+            (cy - (p.bounds[1] + p.bounds[3]) / 2) ** 2
+        )
+        for p in placed_polys
+    )
 
 
 def build_dead_zones(
@@ -203,6 +220,10 @@ def try_place_object(
 
     access_gap = max(clearspace_mm, MIN_ACCESS_GAP_MM)
 
+    # 유효한 후보 위치를 수집 → 가장 분산된 위치(기존 오브젝트와 멀리 떨어진 곳) 선택
+    candidates: list[tuple[float, Polygon, float, float]] = []  # (score, poly, cx, cy)
+    seen_positions: set[tuple[int, int]] = set()  # 중복 위치 방지
+
     for step in range(MAX_STEPS + 1):
         for dx_sign, dy_sign in directions:
             if step == 0:
@@ -211,29 +232,43 @@ def try_place_object(
                 test_cx = cx + dx_sign * STEP_MM * step
                 test_cy = cy + dy_sign * STEP_MM * step
 
+            pos_key = (round(test_cx), round(test_cy))
+            if pos_key in seen_positions:
+                continue
+            seen_positions.add(pos_key)
+
             obj_poly = make_object_polygon(test_cx, test_cy, width_mm, height_mm, rotation_deg)
 
             if not room_poly.contains(obj_poly):
                 continue
             if any(obj_poly.intersects(dz) for dz in dead_zones):
                 continue
-            # 오브젝트 직접 충돌 체크 (0mm 이격)
             if any(obj_poly.intersects(p) for p in placed_polys):
                 continue
-
-            # 접근성 체크: 최소 1개 면이 access_gap 이상 열려야 함
             if not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
                 continue
-
-            # NetworkX 통로 연결성 체크 (이미 배치된 오브젝트 포함)
             if corridor_graph is not None and entrance_pos is not None:
                 if not _corridor_ok(corridor_graph, obj_poly, entrance_pos, placed_polys):
                     continue
 
-            return obj_poly, test_cx, test_cy
+            score = _min_placed_distance(test_cx, test_cy, placed_polys)
+            candidates.append((score, obj_poly, test_cx, test_cy))
 
-        if step == 0:
-            continue
+            # 충분한 후보가 모이면 조기 종료
+            if len(candidates) >= MAX_CANDIDATES:
+                break
+
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+
+        # 분산 탐색 범위 내에서 후보가 있으면 조기 종료 (기준점 근처 우선)
+        if candidates and step >= DISPERSION_SEARCH_STEPS:
+            break
+
+    if candidates:
+        # 기존 오브젝트와 가장 멀리 떨어진 후보 선택 → 자연스러운 분산 배치
+        best = max(candidates, key=lambda c: c[0])
+        return best[1], best[2], best[3]
 
     return None, cx, cy
 
