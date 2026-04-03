@@ -4,6 +4,11 @@ agent2_floor.py — Agent 2: 도면 분석 + Dead Zone 생성
 2단계 구조:
   전반부: OpenCV polygon + OCR 축척 + Claude Vision 설비 감지
   후반부: px→mm + Shapely Dead Zone + NetworkX reference_point 계산
+
+지원 입력 포맷:
+  - PDF (CAD 벡터 추출 → Vision 폴백)
+  - 이미지 (PNG/JPG/WebP) → Vision + OpenCV
+  - DXF / DWG → ezdxf 직접 파싱 (가장 정밀)
 """
 
 from __future__ import annotations
@@ -20,6 +25,212 @@ from core.schemas import (
     BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel
 )
 from core.geometry_utils import px_to_mm
+
+# ─────────────────────────────────────────
+# DXF / DWG 벡터 직접 추출
+# ─────────────────────────────────────────
+
+# 설비 레이어/블록명 → equipment_type 매핑
+_DXF_EQUIPMENT_KEYWORDS: dict[str, str] = {
+    "sprinkler": "sprinkler", "sp": "sprinkler", "spk": "sprinkler",
+    "fire": "fire_extinguisher", "fire_ext": "fire_extinguisher", "fh": "fire_extinguisher",
+    "exit": "exit", "emergency": "exit", "비상구": "exit",
+    "ep": "exit",  # emergency path
+    "출입구": "exit", "entrance": "exit",
+    "panel": "distribution_panel", "elec": "distribution_panel", "dp": "distribution_panel",
+}
+
+
+def _classify_equipment_dxf(name: str) -> str | None:
+    """레이어명/블록명 → equipment_type 분류"""
+    lower = name.lower()
+    for keyword, eq_type in _DXF_EQUIPMENT_KEYWORDS.items():
+        if keyword in lower:
+            return eq_type
+    return None
+
+
+def extract_from_dxf(dxf_bytes: bytes) -> dict | None:
+    """
+    ezdxf로 DXF/DWG 파일 파싱.
+    성공 시 dict 반환, 실패 시 None.
+
+    반환 키:
+      room_polygon_mm  : [(x,y), ...] mm 좌표
+      scale_mm_per_unit: float (1 DXF unit = N mm)
+      equipment_raw    : [{"type": str, "center_mm": (x,y)}]
+      disclaimers      : [str]
+    """
+    import logging
+    try:
+        import ezdxf
+        from ezdxf.math import BoundingBox
+    except ImportError:
+        logging.warning("[Agent2/DXF] ezdxf 미설치 — DXF 파싱 불가")
+        return None
+
+    try:
+        import io, tempfile, os
+        # ezdxf.readfile()이 가장 안정적 — 임시 파일로 저장 후 읽기
+        suffix = ".dxf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(dxf_bytes)
+            tmp_path = tmp.name
+        try:
+            doc = ezdxf.readfile(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        logging.warning(f"[Agent2/DXF] 파일 열기 실패: {e}")
+        return None
+
+    msp = doc.modelspace()
+    disclaimers: list[str] = []
+
+    # ── 1. 단위 결정 ($INSUNITS) ──────────────────────────
+    # 0=없음/인치, 1=인치, 4=mm, 5=cm, 6=m
+    insunits = doc.header.get("$INSUNITS", 4)
+    unit_to_mm: float = {
+        0: 1.0,    # 불명 → mm로 가정
+        1: 25.4,   # 인치
+        2: 304.8,  # 피트
+        4: 1.0,    # mm
+        5: 10.0,   # cm
+        6: 1000.0, # m
+    }.get(insunits, 1.0)
+
+    # ── 2. SCALE 텍스트에서 ratio 추출 ─────────────────────
+    scale_ratio: int | None = None
+    for entity in msp.query("TEXT MTEXT"):
+        try:
+            text = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
+            m = re.search(r"(?:SCALE\s+)?1\s*[:/]\s*(\d+)", text, re.IGNORECASE)
+            if m:
+                scale_ratio = int(m.group(1))
+                break
+        except Exception:
+            continue
+
+    # mm 단위(insunits=4)이면 scale_ratio 무시 — 좌표가 이미 실제 mm
+    # 단위 불명(0)이고 scale_ratio가 있으면 1unit = scale_ratio mm로 가정
+    if insunits == 4:
+        scale_mm_per_unit = 1.0
+    elif insunits == 0 and scale_ratio:
+        scale_mm_per_unit = float(scale_ratio)
+    else:
+        scale_mm_per_unit = unit_to_mm
+
+    def u2mm(v: float) -> float:
+        return v * scale_mm_per_unit
+
+    logging.info(f"[Agent2/DXF] insunits={insunits} scale_ratio={scale_ratio} → {scale_mm_per_unit:.2f}mm/unit")
+
+    # ── 3. 방 외곽선 — WALL 레이어 또는 가장 큰 폴리라인 ──
+    room_polygon_mm: list[tuple[float, float]] = []
+    best_area = 0.0
+
+    for entity in msp.query("LWPOLYLINE POLYLINE LINE"):
+        layer = entity.dxf.layer.upper()
+
+        # WALL 레이어 폴리라인 우선
+        if entity.dxftype() in ("LWPOLYLINE", "POLYLINE"):
+            try:
+                pts = list(entity.get_points())  # (x, y, ...)
+                if len(pts) < 3:
+                    continue
+                from shapely.geometry import Polygon as SPoly
+                poly_pts = [(p[0], p[1]) for p in pts]
+                try:
+                    area = SPoly(poly_pts).area
+                except Exception:
+                    area = 0
+                if "WALL" in layer or area > best_area:
+                    if "WALL" in layer or area > best_area:
+                        best_area = area
+                        room_polygon_mm = [(u2mm(p[0]), u2mm(p[1])) for p in poly_pts]
+            except Exception:
+                continue
+
+    # LINE 엔티티로만 이뤄진 경우 bbox로 폴백
+    if not room_polygon_mm:
+        xs, ys = [], []
+        for entity in msp.query("LINE"):
+            try:
+                xs += [entity.dxf.start.x, entity.dxf.end.x]
+                ys += [entity.dxf.start.y, entity.dxf.end.y]
+            except Exception:
+                continue
+        if xs and ys:
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+            room_polygon_mm = [
+                (u2mm(minx), u2mm(miny)), (u2mm(maxx), u2mm(miny)),
+                (u2mm(maxx), u2mm(maxy)), (u2mm(minx), u2mm(maxy)),
+            ]
+            disclaimers.append("LINE 엔티티 bbox로 방 외곽 추정 (폴리라인 없음)")
+
+    if not room_polygon_mm:
+        logging.warning("[Agent2/DXF] 방 외곽선을 찾지 못했습니다")
+        return None
+
+    # ── 4. 설비 감지 — 레이어명 + INSERT(블록 삽입점) ──────
+    equipment_raw: list[dict] = []
+
+    # INSERT 엔티티 (블록 심볼)
+    for entity in msp.query("INSERT"):
+        try:
+            block_name = entity.dxf.name
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(block_name) or _classify_equipment_dxf(layer)
+            if eq_type:
+                pos = entity.dxf.insert
+                equipment_raw.append({
+                    "type": eq_type,
+                    "center_mm": (u2mm(pos.x), u2mm(pos.y)),
+                })
+        except Exception:
+            continue
+
+    # CIRCLE 엔티티 (스프링클러 원 심볼)
+    for entity in msp.query("CIRCLE"):
+        try:
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(layer)
+            if eq_type:
+                c = entity.dxf.center
+                equipment_raw.append({
+                    "type": eq_type,
+                    "center_mm": (u2mm(c.x), u2mm(c.y)),
+                })
+        except Exception:
+            continue
+
+    # LWPOLYLINE 사각형 — EXIT 레이어
+    for entity in msp.query("LWPOLYLINE"):
+        try:
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(layer)
+            if eq_type and eq_type == "exit":
+                pts = list(entity.get_points())
+                if pts:
+                    cx = sum(p[0] for p in pts) / len(pts)
+                    cy = sum(p[1] for p in pts) / len(pts)
+                    equipment_raw.append({
+                        "type": eq_type,
+                        "center_mm": (u2mm(cx), u2mm(cy)),
+                    })
+        except Exception:
+            continue
+
+    logging.info(f"[Agent2/DXF] 방 외곽 {len(room_polygon_mm)}pts, 설비 {len(equipment_raw)}개, scale={scale_mm_per_unit:.2f}mm/unit")
+
+    return {
+        "room_polygon_mm": room_polygon_mm,
+        "scale_mm_per_unit": scale_mm_per_unit,
+        "equipment_raw": equipment_raw,
+        "disclaimers": disclaimers,
+    }
+
 
 # ─────────────────────────────────────────
 # PDF 벡터 직접 추출 (CAD PDF 전용)
@@ -166,6 +377,14 @@ VISION_PROMPT = """이 도면 이미지를 분석하여 아래 JSON을 출력하
 {
   "room_bbox_px": [x1, y1, x2, y2],
   "scale_ratio": <"SCALE 1:XX" 또는 "1/XX"에서 XX 숫자, 없으면 null>,
+  "labeled_dimensions": [
+    {
+      "real_mm": <치수선/텍스트에 명시된 실제 mm 값 (예: "5,800mm" → 5800)>,
+      "axis": "x" | "y",
+      "span_px": [start_px, end_px],
+      "confidence": "high" | "medium" | "low"
+    }
+  ],
   "equipment": [
     {
       "equipment_type": "sprinkler" | "fire_extinguisher" | "distribution_panel" | "exit" | "bed" | "desk" | "sofa" | "table" | "chair",
@@ -188,6 +407,10 @@ VISION_PROMPT = """이 도면 이미지를 분석하여 아래 JSON을 출력하
 규칙:
 - room_bbox_px: 방의 내벽 경계를 픽셀 좌표로 표현 (도면 용지 여백 제외)
 - scale_ratio: 예) "SCALE 1:50" → 50, "1/100" → 100
+- labeled_dimensions: 도면에 명시된 치수 텍스트를 모두 추출하세요.
+  예) "5,800mm (전체 폭)" 또는 "12,000mm" → real_mm=5800 또는 12000
+  span_px: 해당 치수가 표시하는 두 끝점의 픽셀 x (axis=x) 또는 y (axis=y) 좌표
+  가장 큰 치수(전체 폭, 전체 높이)를 우선 추출하세요 — 최대 4개
 - 추측 금지, 확인된 값만 기재
 """
 
@@ -267,23 +490,51 @@ def compute_scale(
     """
     px당 mm 배율 계산. 우선순위:
     1. 축척 바 실측 (real_length_mm / pixel_length)
-    2. scale_ratio 텍스트 + 페이지 실제 크기 (mm_per_px × ratio)
-    3. fallback 1.0
+    2. 도면 치수 텍스트 직접 읽기 (labeled_dimensions — 가장 신뢰도 높음)
+    3. scale_ratio 텍스트 + 페이지 실제 크기 (mm_per_px × ratio)
+    4. fallback 1.0
     """
+    import logging
     conf_map = {"high": ConfidenceLevel.HIGH, "medium": ConfidenceLevel.MEDIUM, "low": ConfidenceLevel.LOW}
 
     # 1) 축척 바 실측
     si = vision_result.get("scale_indicator", {})
     if si.get("found") and si.get("real_length_mm") and si.get("pixel_length"):
         scale = si["real_length_mm"] / si["pixel_length"]
+        logging.info(f"[Agent2/Scale] 방법=축척바 scale_mm_per_px={scale:.3f}")
         return scale, conf_map.get(si.get("confidence", "medium"), ConfidenceLevel.MEDIUM)
 
-    # 2) scale_ratio ("1:50" → 50) + 페이지 실제 크기
+    # 2) 치수 텍스트 직접 읽기 — "5,800mm (전체 폭)" 같은 레이블
+    dims = vision_result.get("labeled_dimensions", [])
+    candidates: list[float] = []
+    for d in dims:
+        real_mm = d.get("real_mm")
+        span = d.get("span_px")
+        conf_str = d.get("confidence", "low")
+        if real_mm and span and len(span) == 2 and span[1] > span[0]:
+            px_span = abs(span[1] - span[0])
+            if px_span > 10:  # 너무 짧은 스팬은 노이즈
+                scale_candidate = real_mm / px_span
+                # 합리적인 범위 필터 (0.1mm/px ~ 100mm/px)
+                if 0.1 <= scale_candidate <= 100:
+                    candidates.append(scale_candidate)
+                    logging.info(f"[Agent2/Scale] 치수 후보: real={real_mm}mm span={px_span}px → {scale_candidate:.3f}mm/px (conf={conf_str})")
+    if candidates:
+        # 중앙값 사용 (이상값 제거)
+        candidates.sort()
+        scale = candidates[len(candidates) // 2]
+        logging.info(f"[Agent2/Scale] 방법=치수텍스트 scale_mm_per_px={scale:.3f} (후보 {len(candidates)}개)")
+        return scale, ConfidenceLevel.HIGH
+
+    # 3) scale_ratio ("1:50" → 50) + 페이지 실제 크기
     scale_ratio = vision_result.get("scale_ratio")
     if scale_ratio and image_size_px and page_size_mm:
         mm_per_px_on_paper = page_size_mm[0] / image_size_px[0]
-        return mm_per_px_on_paper * float(scale_ratio), ConfidenceLevel.MEDIUM
+        scale = mm_per_px_on_paper * float(scale_ratio)
+        logging.info(f"[Agent2/Scale] 방법=scale_ratio({scale_ratio}) scale_mm_per_px={scale:.3f}")
+        return scale, ConfidenceLevel.MEDIUM
 
+    logging.warning("[Agent2/Scale] 방법=fallback(1.0) — 스케일 감지 실패")
     return 1.0, ConfidenceLevel.LOW
 
 
@@ -337,12 +588,15 @@ async def run_agent2(
     client: anthropic.AsyncAnthropic,
     page_size_mm: tuple[float, float] | None = None,
     pdf_bytes: bytes | None = None,
+    dxf_bytes: bytes | None = None,
 ) -> tuple[FloorAnalysis, dict, dict]:
     """
     반환: (FloorAnalysis, constraints_dict, image_meta)
 
-    PDF 입력 시: 벡터 직접 추출 → Vision/OpenCV 스킵
-    이미지 입력 시: Vision(Haiku) → OpenCV 폴백
+    처리 경로 우선순위:
+      경로 A-1: DXF/DWG → ezdxf 직접 파싱 (가장 정밀)
+      경로 A-2: PDF     → fitz 벡터 추출
+      경로 B:   이미지  → Vision(Haiku) + OpenCV 폴백
     """
     import logging
 
@@ -354,7 +608,72 @@ async def run_agent2(
     image_size_px: tuple[int, int] | None = None
     room_bbox_px = None
 
-    # ── 경로 A: PDF 벡터 직접 추출 ────────────────────
+    # ── 경로 A-1: DXF/DWG 직접 파싱 ──────────────────
+    if dxf_bytes:
+        dxf_result = extract_from_dxf(dxf_bytes)
+        if dxf_result:
+            logging.info(f"[Agent2/DXF] 성공 — polygon={len(dxf_result['room_polygon_mm'])}pts, "
+                         f"equipment={len(dxf_result['equipment_raw'])}개, "
+                         f"scale={dxf_result['scale_mm_per_unit']:.2f}mm/unit")
+
+            room_polygon_mm = dxf_result["room_polygon_mm"]
+            scale_confidence = ConfidenceLevel.HIGH
+            # DXF는 px 좌표계가 없으므로 scale_mm_per_px를 1로 설정
+            # (렌더링은 mm 좌표 직접 사용)
+            scale_mm_per_px = 1.0
+            disclaimers.extend(dxf_result.get("disclaimers", []))
+
+            for eq in dxf_result["equipment_raw"]:
+                cx_mm, cy_mm = eq["center_mm"]
+                all_equipment.append(Equipment(
+                    equipment_type=eq["type"],
+                    position_px=(cx_mm, cy_mm),   # px 좌표 대신 mm 사용
+                    position_mm=(cx_mm, cy_mm),
+                    confidence=ConfidenceLevel.HIGH,
+                    source="auto_detected",
+                ))
+
+            # 렌더링용 bbox (mm 좌표 = px 좌표, scale=1)
+            xs = [p[0] for p in room_polygon_mm]
+            ys = [p[1] for p in room_polygon_mm]
+            room_bbox_px = [min(xs), min(ys), max(xs), max(ys)]
+            image_size_px = (int(max(xs)), int(max(ys)))
+
+            # 공통 후처리로 진행 (reference_points, dead_zones)
+            reference_points = _generate_reference_points(room_polygon_mm, all_equipment)
+            if user_marked_equipment:
+                for eq in user_marked_equipment:
+                    pos_px = eq["position_px"]
+                    pos_mm = (float(pos_px[0]), float(pos_px[1]))
+                    all_equipment.append(Equipment(
+                        equipment_type=eq["equipment_type"],
+                        position_px=tuple(pos_px),
+                        position_mm=pos_mm,
+                        confidence=ConfidenceLevel.USER_INPUT,
+                        source="user_marked",
+                    ))
+            entrance_pos = next(
+                (rp.position_mm for rp in reference_points if rp.name == "entrance"), None
+            )
+            if entrance_pos:
+                reference_points = _assign_zone_labels(reference_points, room_polygon_mm, entrance_pos)
+            dead_zones_mm = _generate_dead_zones(all_equipment, standards)
+            eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
+            floor = FloorAnalysis(
+                room_polygon_mm=room_polygon_mm,
+                dead_zones_mm=dead_zones_mm,
+                reference_points=reference_points,
+                eligible_objects=eligible_objects,
+                scale_mm_per_px=scale_mm_per_px,
+                scale_confidence=scale_confidence,
+                equipment_detected=all_equipment,
+                disclaimer_items=disclaimers,
+            )
+            constraints = build_constraints(floor, standards)
+            image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
+            return floor, constraints, image_meta
+
+    # ── 경로 A-2: PDF 벡터 직접 추출 ─────────────────
     vec = extract_from_pdf_vectors(pdf_bytes) if pdf_bytes else None
 
     if vec:

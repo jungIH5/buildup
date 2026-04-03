@@ -32,16 +32,23 @@ class UserMarkingItem(BaseModel):
     position_px: tuple[float, float]
 
 
+def _is_dxf_file(filename: str, content_type: str) -> bool:
+    """DXF 또는 DWG 파일 여부 판별"""
+    name = filename.lower()
+    return name.endswith(".dxf") or name.endswith(".dwg") or "dxf" in content_type
+
+
 @router.post("/run")
 async def run_pipeline(
     request: Request,
     brand_manual: Optional[UploadFile] = File(None, description="브랜드 메뉴얼 PDF (선택사항)"),
-    floor_plan: Optional[UploadFile] = File(None, description="도면 이미지/PDF (선택사항)"),
+    floor_plan: Optional[UploadFile] = File(None, description="도면 파일 — 이미지/PDF/DXF/DWG (선택사항)"),
     user_markings: Optional[str] = Form(None, description="사용자 마킹 JSON 문자열"),
     user_requirements: Optional[str] = Form(None, description="사용자 배치 요구사항 자유 텍스트"),
 ):
     """
     Agent 1 → Agent 2 → Agent 3 전체 파이프라인 실행.
+    도면 포맷: 이미지(PNG/JPG) · PDF · DXF · DWG 모두 지원.
     """
     client = request.app.state.anthropic
 
@@ -76,12 +83,26 @@ async def run_pipeline(
     try:
         if floor_plan:
             floor_bytes = image_bytes
+            filename = floor_plan.filename or ""
+            content_type = floor_plan.content_type or ""
 
-            # PDF인 경우 PNG로 변환
-            page_size_mm = None
-            original_pdf_bytes = None
-            if floor_plan.content_type == "application/pdf" or floor_plan.filename.lower().endswith(".pdf"):
-                import fitz  # PyMuPDF
+            # ── DXF / DWG 경로 ──────────────────────────────
+            if _is_dxf_file(filename, content_type):
+                import logging
+                logging.info(f"[Pipeline] DXF/DWG 입력 감지: {filename}")
+                floor, constraints, image_meta = await run_agent2(
+                    image_bytes=b"",          # DXF는 이미지 불필요
+                    standards=standards,
+                    user_marked_equipment=markings,
+                    client=client,
+                    dxf_bytes=floor_bytes,
+                )
+                # DXF는 별도 PNG 렌더링 없음 (3D 뷰는 room_polygon_mm 기반으로 그림)
+                floor_png_b64 = None
+
+            # ── PDF 경로 ────────────────────────────────────
+            elif filename.lower().endswith(".pdf") or content_type == "application/pdf":
+                import fitz
                 original_pdf_bytes = floor_bytes
                 doc = fitz.open(stream=floor_bytes, filetype="pdf")
                 page = doc.load_page(0)
@@ -89,18 +110,25 @@ async def run_pipeline(
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 floor_bytes = pix.tobytes("png")
                 doc.close()
+                floor_png_b64 = base64.b64encode(floor_bytes).decode()
+                floor, constraints, image_meta = await run_agent2(
+                    image_bytes=floor_bytes,
+                    standards=standards,
+                    user_marked_equipment=markings,
+                    client=client,
+                    page_size_mm=page_size_mm,
+                    pdf_bytes=original_pdf_bytes,
+                )
 
-            # 변환된 PNG를 프론트엔드 텍스처용으로 보관
-            floor_png_b64 = base64.b64encode(floor_bytes).decode()
-
-            floor, constraints, image_meta = await run_agent2(
-                image_bytes=floor_bytes,
-                standards=standards,
-                user_marked_equipment=markings,
-                client=client,
-                page_size_mm=page_size_mm,
-                pdf_bytes=original_pdf_bytes,
-            )
+            # ── 이미지 경로 (PNG/JPG/WebP) ──────────────────
+            else:
+                floor_png_b64 = base64.b64encode(floor_bytes).decode()
+                floor, constraints, image_meta = await run_agent2(
+                    image_bytes=floor_bytes,
+                    standards=standards,
+                    user_marked_equipment=markings,
+                    client=client,
+                )
         else:
             # 도면이 없을 때: 10m x 8m 가상 샘플 공간 생성
             from agents.agent2_floor import FloorAnalysis, ReferencePoint, ConfidenceLevel
@@ -173,6 +201,8 @@ async def run_pipeline(
         "image_size_px": image_meta.get("image_size_px"),
         "room_bbox_px": image_meta.get("room_bbox_px"),
         "floor_plan_png": floor_png_b64,
+        "scale_mm_per_px": floor.scale_mm_per_px,
+        "scale_confidence": floor.scale_confidence.value,
         # Agent 3 재실행용 캐시 (Agent 1·2 결과 재활용)
         "_cache": {
             "floor": floor.model_dump(),

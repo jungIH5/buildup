@@ -40,6 +40,8 @@ interface PipelineResult {
   image_size_px?: [number, number];
   room_bbox_px?: [number, number, number, number];
   floor_plan_png?: string;
+  scale_mm_per_px?: number;
+  scale_confidence?: string;
   _cache?: { floor: unknown; standards: unknown; constraints: unknown; emergency_exits: unknown };
 }
 
@@ -279,15 +281,22 @@ const App: React.FC = () => {
                 {/* 도면 */}
                 <label className="block">
                   <div className="text-xs text-text-muted mb-1 flex items-center gap-1">
-                    <Layers size={11} className="text-accent" /> 도면 파일 (이미지·PDF)
+                    <Layers size={11} className="text-accent" /> 도면 파일 (이미지·PDF·DXF·DWG)
                   </div>
                   <div className="border border-dashed border-border rounded-xl p-3 cursor-pointer hover:border-accent/50 transition-colors group">
-                    <input type="file" className="hidden" accept="image/*,.pdf"
+                    <input type="file" className="hidden" accept="image/*,.pdf,.dxf,.dwg"
                       onChange={e => setFloorPlan(e.target.files?.[0] || null)} />
                     <div className="flex items-center gap-2">
                       <Upload size={14} className="text-text-muted group-hover:text-accent transition-colors shrink-0" />
                       <span className="text-xs text-text-muted truncate">
-                        {floorPlan ? floorPlan.name : '파일 선택 또는 드래그'}
+                        {floorPlan ? (
+                          <span className="flex items-center gap-1">
+                            {floorPlan.name}
+                            {(floorPlan.name.endsWith('.dxf') || floorPlan.name.endsWith('.dwg')) && (
+                              <span className="bg-accent/20 text-accent text-[9px] px-1 rounded font-bold">CAD</span>
+                            )}
+                          </span>
+                        ) : '파일 선택 또는 드래그'}
                       </span>
                     </div>
                   </div>
@@ -492,6 +501,31 @@ const App: React.FC = () => {
                     <div className="text-[9px] uppercase tracking-wider text-text-muted">추출 출처</div>
                     <div className="text-xs font-bold">{result.brand_standards.source}</div>
                   </div>
+                  {result.scale_mm_per_px !== undefined && (
+                    <div className={`bg-white/5 px-2.5 py-2 rounded-lg col-span-2 border ${
+                      result.scale_confidence === 'high' ? 'border-green-500/30' :
+                      result.scale_confidence === 'medium' ? 'border-yellow-500/30' : 'border-red-500/30'
+                    }`}>
+                      <div className="text-[9px] uppercase tracking-wider text-text-muted">도면 스케일 감지</div>
+                      <div className="text-xs font-bold">
+                        {result.scale_mm_per_px.toFixed(2)}mm/px
+                        <span className={`ml-1.5 text-[10px] ${
+                          result.scale_confidence === 'high' ? 'text-green-400' :
+                          result.scale_confidence === 'medium' ? 'text-yellow-400' : 'text-red-400'
+                        }`}>
+                          {result.scale_confidence === 'high' ? '✓ 정확' :
+                           result.scale_confidence === 'medium' ? '△ 보통' : '✗ 실패(기본값)'}
+                        </span>
+                      </div>
+                      {result.room_polygon_mm && result.room_polygon_mm.length > 0 && (() => {
+                        const xs = result.room_polygon_mm!.map(p => p[0]);
+                        const ys = result.room_polygon_mm!.map(p => p[1]);
+                        const w = Math.round(Math.max(...xs) - Math.min(...xs));
+                        const h = Math.round(Math.max(...ys) - Math.min(...ys));
+                        return <div className="text-[10px] text-text-muted mt-0.5">방 {w}×{h}mm</div>;
+                      })()}
+                    </div>
+                  )}
                 </div>
               </div>
             </>

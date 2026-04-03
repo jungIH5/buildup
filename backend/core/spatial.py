@@ -24,17 +24,21 @@ from core.violations import (
 )
 from core.geometry_utils import DEFAULT_FURNITURE_HEIGHTS
 
-# 코드 레벨 위치 조정 파라미터
-STEP_MM: float = 50.0    # 한 번 밀 때 이동 거리
-MAX_STEPS: int = 30       # 최대 시도 횟수 (수량 많을 때 더 넓은 범위 탐색)
-CORRIDOR_GRID_MM: float = 150.0   # 통로 체크 격자 크기
+# 그리드 스캔 파라미터
+GRID_STEP_MM: float = 200.0        # x-y 그리드 간격 (방 전체를 균일하게 탐색)
+CORRIDOR_GRID_MM: float = 150.0    # 통로 체크 격자 크기
 
 # 사람 1명 통과 최소 통행폭 (브랜드 clearspace와 별개)
 MIN_ACCESS_GAP_MM: float = 600.0
 
-# 분산 배치: 유효 후보 중 기존 오브젝트와 가장 멀리 떨어진 위치 선택
-DISPERSION_SEARCH_STEPS: int = 12  # 이 스텝까지는 후보 수집, 최고 분산 점수 선택
-MAX_CANDIDATES: int = 16           # 충분한 후보가 쌓이면 조기 종료
+# 오브젝트 타입별 중요도 (낮을수록 먼저 배치)
+OBJECT_PRIORITY: dict[str, int] = {
+    "character_bbox": 1,    # 캐릭터 조형물 — 브랜드 상징, 최우선
+    "photo_zone": 2,        # 포토존 — 방문객 체험 핵심
+    "banner_stand": 3,      # 배너 스탠드 — 시각적 홍보
+    "product_display": 4,   # 상품 진열대
+    "shelf_rental": 5,      # 렌탈 선반
+}
 
 
 def _build_walkability_graph(
@@ -115,6 +119,27 @@ def _min_placed_distance(cx: float, cy: float, placed_polys: list[Polygon]) -> f
         )
         for p in placed_polys
     )
+
+
+def _score_position(
+    x: float, y: float,
+    ref_cx: float, ref_cy: float,
+    placed_polys: list[Polygon],
+) -> float:
+    """
+    배치 점수 = 분산 가중치(70%) + 기준점 근접 가중치(30%).
+    첫 오브젝트(placed_polys 없음): 기준점에 가장 가까운 위치 우선.
+    """
+    ref_dist = math.sqrt((x - ref_cx) ** 2 + (y - ref_cy) ** 2)
+    disp = _min_placed_distance(x, y, placed_polys)
+
+    if disp == float('inf'):
+        # 첫 오브젝트: 기준점에 가장 가까운 곳
+        return -ref_dist
+
+    # 기준점 근접 보너스 (5,000mm 거리에서 37% 수준으로 감소)
+    ref_bonus = math.exp(-ref_dist / 5000.0)
+    return disp * (0.7 + 0.3 * ref_bonus)
 
 
 def build_dead_zones(
@@ -208,69 +233,62 @@ def try_place_object(
     clearspace_mm: float = MIN_ACCESS_GAP_MM,
 ) -> tuple[Polygon | None, float, float]:
     """
-    주어진 위치에 오브젝트 배치 시도.
-    충돌 시 STEP_MM 씩 밀어서 MAX_STEPS 회까지 재시도.
-    - clearspace_mm: 접근성 체크에 쓸 최소 통행폭 (브랜드 clearspace가 아닌 사람 통행 기준)
-    - 오브젝트 간 직접 충돌(0mm)은 항상 체크
-    - 접근성: 최소 1개 면 이상 MIN_ACCESS_GAP_MM 이상 열려있어야 함
-    성공하면 (polygon, cx, cy), 실패하면 (None, cx, cy).
+    방 전체를 x-y 그리드 순서로 스캔하여 제약 조건을 만족하는 후보를 수집.
+    (cx, cy)는 Agent 3이 지정한 기준점 — 분산 점수 계산 시 근접 가중치에 활용.
+    스캔 순서: x=minx→maxx, y=miny→maxy (GRID_STEP_MM 간격).
+    점수 = 기존 오브젝트와의 거리(분산) * 기준점 근접 보너스.
+    최종 corridor 체크는 상위 후보에만 적용해 성능 확보.
     """
-    directions = [(1, 0), (0, 1), (-1, 0), (0, -1),
-                  (1, 1), (-1, 1), (1, -1), (-1, -1)]
-
     access_gap = max(clearspace_mm, MIN_ACCESS_GAP_MM)
 
-    # 유효한 후보 위치를 수집 → 가장 분산된 위치(기존 오브젝트와 멀리 떨어진 곳) 선택
-    candidates: list[tuple[float, Polygon, float, float]] = []  # (score, poly, cx, cy)
-    seen_positions: set[tuple[int, int]] = set()  # 중복 위치 방지
+    minx, miny, maxx, maxy = room_poly.bounds
+    half_w = width_mm / 2
+    half_h = height_mm / 2
 
-    for step in range(MAX_STEPS + 1):
-        for dx_sign, dy_sign in directions:
-            if step == 0:
-                test_cx, test_cy = cx, cy
-            else:
-                test_cx = cx + dx_sign * STEP_MM * step
-                test_cy = cy + dy_sign * STEP_MM * step
+    candidates: list[tuple[float, Polygon, float, float]] = []  # (score, poly, x, y)
 
-            pos_key = (round(test_cx), round(test_cy))
-            if pos_key in seen_positions:
-                continue
-            seen_positions.add(pos_key)
+    # (0,0) 에 해당하는 room 기준 왼쪽-아래 모서리부터 x→y 순으로 스캔
+    test_x = minx + half_w
+    while test_x <= maxx - half_w:
+        test_y = miny + half_h
+        while test_y <= maxy - half_h:
+            obj_poly = make_object_polygon(test_x, test_y, width_mm, height_mm, rotation_deg)
 
-            obj_poly = make_object_polygon(test_cx, test_cy, width_mm, height_mm, rotation_deg)
-
+            # 제약 조건 검사 (순서: 빠른 것 먼저)
             if not room_poly.contains(obj_poly):
+                test_y += GRID_STEP_MM
                 continue
             if any(obj_poly.intersects(dz) for dz in dead_zones):
+                test_y += GRID_STEP_MM
                 continue
             if any(obj_poly.intersects(p) for p in placed_polys):
+                test_y += GRID_STEP_MM
                 continue
             if not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
+                test_y += GRID_STEP_MM
                 continue
-            if corridor_graph is not None and entrance_pos is not None:
-                if not _corridor_ok(corridor_graph, obj_poly, entrance_pos, placed_polys):
-                    continue
 
-            score = _min_placed_distance(test_cx, test_cy, placed_polys)
-            candidates.append((score, obj_poly, test_cx, test_cy))
+            score = _score_position(test_x, test_y, cx, cy, placed_polys)
+            candidates.append((score, obj_poly, test_x, test_y))
 
-            # 충분한 후보가 모이면 조기 종료
-            if len(candidates) >= MAX_CANDIDATES:
-                break
+            test_y += GRID_STEP_MM
+        test_x += GRID_STEP_MM
 
-        if len(candidates) >= MAX_CANDIDATES:
-            break
+    if not candidates:
+        return None, cx, cy
 
-        # 분산 탐색 범위 내에서 후보가 있으면 조기 종료 (기준점 근처 우선)
-        if candidates and step >= DISPERSION_SEARCH_STEPS:
-            break
+    # 분산+기준점 점수 기준 내림차순 정렬
+    candidates.sort(key=lambda c: -c[0])
 
-    if candidates:
-        # 기존 오브젝트와 가장 멀리 떨어진 후보 선택 → 자연스러운 분산 배치
-        best = max(candidates, key=lambda c: c[0])
-        return best[1], best[2], best[3]
+    # 상위 후보에 대해서만 통로 연결성 체크 (비용이 큰 검사)
+    if corridor_graph is not None and entrance_pos is not None:
+        for score, obj_poly, bx, by in candidates[:10]:
+            if _corridor_ok(corridor_graph, obj_poly, entrance_pos, placed_polys):
+                return obj_poly, bx, by
+        return None, cx, cy
 
-    return None, cx, cy
+    best = candidates[0]
+    return best[1], best[2], best[3]
 
 
 def compute_layout(
@@ -302,8 +320,11 @@ def compute_layout(
     entrance_pos: tuple[float, float] | None = entrance_rp.position_mm if entrance_rp else None
     corridor_graph, _ = _build_walkability_graph(room_poly, dead_zones)
 
-    # priority 순 정렬
-    sorted_placements = sorted(placements, key=lambda p: p.priority)
+    # 오브젝트 중요도(OBJECT_PRIORITY) 우선, 같으면 LLM이 부여한 priority 순
+    sorted_placements = sorted(
+        placements,
+        key=lambda p: (OBJECT_PRIORITY.get(p.object_type, 10), p.priority),
+    )
 
     for intent in sorted_placements:
         # 오브젝트 크기 조회
@@ -348,9 +369,8 @@ def compute_layout(
         if obj_poly is None:
             failed_objects.append({
                 "object_type": intent.object_type,
-                "reason": f"'{intent.reference_point}' 기준점 주변 {MAX_STEPS * STEP_MM:.0f}mm 내에 배치 가능 공간 없음 (통로 포함)",
+                "reason": f"방 전체 그리드 스캔 ({GRID_STEP_MM:.0f}mm 간격)에서 배치 가능 공간 없음 (충돌·데드존·접근성·통로 제약)",
                 "reference_point": intent.reference_point,
-                "tried_steps": MAX_STEPS,
             })
             continue
 
