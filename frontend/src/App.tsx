@@ -158,8 +158,11 @@ const App: React.FC = () => {
       const payload = {
         ...layoutCache.current,
         user_requirements: fullReqs !== undefined ? fullReqs : appliedReqs.join('\n') || null,
+        // 현재 배치된 오브젝트를 전달 — 백엔드에서 위치를 보존하고 신규만 추가 배치
+        existing_placed: localPlaced.length > 0 ? localPlaced : null,
       };
       const res = await axios.post('http://localhost:8000/api/pipeline/layout_only', payload);
+      // 백엔드가 기존 + 신규를 합쳐 반환하므로 그대로 교체
       setResult(prev => prev ? {
         ...prev,
         placed: res.data.placed,

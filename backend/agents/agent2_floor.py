@@ -298,17 +298,62 @@ def extract_from_pdf_vectors(pdf_bytes: bytes) -> dict | None:
         doc.close()
         return None
 
-    # 방 외곽 폴리곤 — items에서 꼭짓점 추출, 없으면 rect 사용
+    # 방 외곽 폴리곤 — items에서 꼭짓점 추출
+    # 직선("l"), 사각형("re"), 3차 베지어 곡선("c") 모두 처리.
+    # 곡선은 BEZIER_SAMPLES 구간으로 샘플링해 다각형 근사 → 원형·타원·곡선 공간 지원.
+    BEZIER_SAMPLES = 14  # 곡선 1개당 샘플 수 (정확도↔속도 트레이드오프)
+
+    def _sample_cubic_bezier(
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+        p3: tuple[float, float],
+        n: int,
+    ) -> list[tuple[float, float]]:
+        """3차 베지어 곡선을 n+1개 점으로 샘플링 (시작점 제외, 끝점 포함)."""
+        pts = []
+        for i in range(1, n + 1):
+            t = i / n
+            mt = 1 - t
+            x = mt**3 * p0[0] + 3 * mt**2 * t * p1[0] + 3 * mt * t**2 * p2[0] + t**3 * p3[0]
+            y = mt**3 * p0[1] + 3 * mt**2 * t * p1[1] + 3 * mt * t**2 * p2[1] + t**3 * p3[1]
+            pts.append((x, y))
+        return pts
+
+    # get_drawings() items 포맷 (PyMuPDF 공식):
+    #   ("l",  p1, p2)           — 직선: 시작점·끝점 명시
+    #   ("c",  p0, p1, p2, p3)  — 3차 베지어: 시작점·제어점1·제어점2·끝점 명시
+    #   ("re", rect)             — 사각형
+    #   ("qu", quad)             — 사각형(quad)
+    # "m"(moveto)은 get_drawings()에 없음 — 모든 아이템이 시작점을 명시적으로 포함
     room_pts: list[tuple[float, float]] = []
+
     for item in room_drawing.get("items", []):
-        if item[0] == "l":          # ('l', Point_start, Point_end)
-            p = item[1]
-            room_pts.append((p.x, p.y))
-        elif item[0] == "re":       # ('re', Rect, ...)
+        kind = item[0]
+
+        if kind == "l":             # ('l', p1, p2) — 직선
+            room_pts.append((item[1].x, item[1].y))
+            room_pts.append((item[2].x, item[2].y))
+
+        elif kind == "c":           # ('c', p0, ctrl1, ctrl2, p3) — 3차 베지어
+            p0    = (item[1].x, item[1].y)
+            ctrl1 = (item[2].x, item[2].y)
+            ctrl2 = (item[3].x, item[3].y)
+            p3    = (item[4].x, item[4].y)
+            # 시작점 포함 + 곡선 샘플링
+            room_pts.append(p0)
+            room_pts.extend(_sample_cubic_bezier(p0, ctrl1, ctrl2, p3, BEZIER_SAMPLES))
+
+        elif kind == "re":          # ('re', Rect) — 사각형
             r2 = item[1]
             room_pts += [(r2.x0, r2.y0), (r2.x1, r2.y0), (r2.x1, r2.y1), (r2.x0, r2.y1)]
 
-    # 중복 제거 + 순서 유지
+        elif kind == "qu":          # ('qu', Quad) — 사각형(quad)
+            q = item[1]
+            room_pts += [(q.ul.x, q.ul.y), (q.ur.x, q.ur.y),
+                         (q.lr.x, q.lr.y), (q.ll.x, q.ll.y)]
+
+    # 중복 제거 + 순서 유지 (연속된 동일 점 제거)
     seen: set = set()
     unique_pts: list[tuple[float, float]] = []
     for p in room_pts:
@@ -317,7 +362,7 @@ def extract_from_pdf_vectors(pdf_bytes: bytes) -> dict | None:
             seen.add(key)
             unique_pts.append(p)
 
-    # 꼭짓점이 3개 미만이면 rect 폴백
+    # 꼭짓점이 3개 미만이면 rect 폴백 (곡선 처리 후에도 실패하는 경우 대비)
     if len(unique_pts) < 3:
         r = room_drawing["rect"]
         unique_pts = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]

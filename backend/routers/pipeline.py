@@ -220,12 +220,14 @@ class LayoutOnlyRequest(BaseModel):
     constraints: dict
     emergency_exits: list[list[float]] | None = None
     user_requirements: str | None = None
+    existing_placed: list[dict] | None = None  # 현재 화면에 배치된 오브젝트 (보존 대상)
 
 
 @router.post("/layout_only")
 async def layout_only(request: Request, body: LayoutOnlyRequest):
     """
     Agent 3만 재실행. Agent 1·2 결과(floor, standards)를 캐시에서 받아 배치만 다시 생성.
+    existing_placed가 있으면 해당 오브젝트 위치를 유지하고 신규 추가분만 배치한다.
     """
     client = request.app.state.anthropic
 
@@ -250,6 +252,7 @@ async def layout_only(request: Request, body: LayoutOnlyRequest):
             emergency_exits=emergency_exits,
             relationships=standards.relationships if standards.relationships else None,
             user_requirements=body.user_requirements,
+            existing_placed=body.existing_placed or None,
         )
     except Exception as e:
         import traceback; traceback.print_exc()

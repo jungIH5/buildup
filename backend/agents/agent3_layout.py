@@ -28,6 +28,13 @@ SYSTEM_PROMPT = """당신은 공간 배치 전문가입니다.
 3. 반드시 JSON 형식으로만 응답하세요.
 4. 오브젝트를 공간 전체에 고르게 분산하세요 — 동일 reference_point에 최대 2개까지만 배치.
 5. entrance_zone / mid_zone / deep_zone을 균형 있게 활용해 한쪽으로 몰리지 않게 하세요.
+
+product_display(상품진열대) 클러스터 규칙:
+6. product_display 1-6개: 동일한 reference_point 1개에 묶어서 배치하세요.
+7. product_display 7개 이상: 서로 다른 zone의 reference_point 2개에 나누어 배치하세요.
+   예) 7개 → mid_zone 기준점에 4개 + deep_zone 기준점에 3개
+8. 같은 그룹 내 모든 product_display는 반드시 동일한 reference_point를 사용하세요.
+   (배치 엔진이 그룹 단위로 클러스터 계산하므로, 기준점이 다르면 별도 그룹으로 처리됩니다)
 """
 
 PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치 의도를 결정하세요.
@@ -109,15 +116,42 @@ async def run_agent3(
     emergency_exits: list[tuple[float, float]] | None = None,
     relationships: list[dict] | None = None,
     user_requirements: str | None = None,
+    existing_placed: list | None = None,
 ) -> LayoutResult:
     """
     Agent 3 메인 진입점.
     - LLM 배치 의도 결정 → Shapely 계산
     - 실패 오브젝트는 Agent 3 재호출 (최대 2회)
+    - existing_placed: 이미 배치된 오브젝트 목록 (PlacedObject 또는 dict).
+      전달 시 해당 오브젝트의 위치는 보존하고, 신규 추가분만 배치한다.
     - 최종 결과: 성공 + 실패 분리된 LayoutResult
     """
+    from core.spatial import make_object_polygon as _make_poly
+
+    # ── 기존 배치 초기화 ──────────────────────────────────────────
+    # existing_placed가 있으면 해당 오브젝트들은 이미 배치 완료로 간주.
+    # all_placed에 포함시켜 최종 결과에 유지하고,
+    # all_placed_polys에 추가해 신규 배치 시 충돌 방지.
     all_placed: list = []
-    all_placed_polys: list[Polygon] = []  # 라운드 간 충돌 체크용
+    all_placed_polys: list[Polygon] = []
+
+    existing_counts: dict[str, int] = {}
+    if existing_placed:
+        for obj in existing_placed:
+            if hasattr(obj, "object_type"):
+                ot = obj.object_type
+                pos = obj.position_mm
+                bbox = obj.bbox_mm
+                rot = obj.rotation_deg
+            else:
+                ot = obj["object_type"]
+                pos = obj["position_mm"]
+                bbox = obj["bbox_mm"]
+                rot = obj.get("rotation_deg", 0.0)
+            existing_counts[ot] = existing_counts.get(ot, 0) + 1
+            all_placed.append(obj)
+            all_placed_polys.append(_make_poly(pos[0], pos[1], bbox[0], bbox[1], rot))
+
     all_failed: list = []
     all_violations: list = []
 
@@ -159,9 +193,15 @@ async def run_agent3(
     for obj_type, qty in qty_overrides.items():
         final_counts[obj_type] = max(final_counts.get(obj_type, 0), qty)
 
-    # 기본 오브젝트를 먼저, 추가 수량을 뒤에 붙임 (priority 정렬로 기본이 먼저 배치됨)
+    # 기존 배치 수량 차감 — 이미 배치된 만큼은 신규 배치 불필요
+    new_counts: dict[str, int] = {}
+    for obj_type, total in final_counts.items():
+        remaining = total - existing_counts.get(obj_type, 0)
+        if remaining > 0:
+            new_counts[obj_type] = remaining
+
     expanded_objects: list[str] = []
-    for obj_type, count in final_counts.items():
+    for obj_type, count in new_counts.items():
         expanded_objects.extend([obj_type] * count)
 
     remaining_objects = expanded_objects

@@ -291,6 +291,246 @@ def try_place_object(
     return best[1], best[2], best[3]
 
 
+def plan_cluster_layout(
+    count: int,
+    unit_w: float,
+    unit_d: float,
+    gap_mm: float = 50.0,
+) -> list[list[tuple[float, float, float]]]:
+    """
+    N개의 product_display 배치 형태를 결정.
+    반환: 서브클러스터별 [(rel_x, rel_y, rotation_deg), ...] 리스트의 리스트.
+    최대 2줄 깊이 제한 — 3줄 이상이면 중간 줄 접근 불가.
+
+    배치 형태:
+    - 1-2개: 1행 단열
+    - 3-4개: 2열 2행 (또는 1행)
+    - 5-6개: 2행 배치 (앞행 ceil(N/2), 뒷행 floor(N/2))
+    - 7개↑: 두 서브클러스터로 분리
+    """
+    if count >= 7:
+        half = count // 2
+        return plan_cluster_layout(half, unit_w, unit_d, gap_mm) + \
+               plan_cluster_layout(count - half, unit_w, unit_d, gap_mm)
+
+    if count <= 2:
+        # 1행 단열
+        units = []
+        for i in range(count):
+            units.append((i * (unit_w + gap_mm), 0.0, 0.0))
+        return [units]
+
+    # 3-6개: 최대 2행
+    cols = math.ceil(count / 2)
+    rows = math.ceil(count / cols)  # 2 이하 보장
+    units = []
+    idx = 0
+    for r in range(rows):
+        # 뒷행(r=1)은 앞행 기준으로 unit_d + gap 뒤에 배치
+        row_count = cols if (r < rows - 1 or count % cols == 0) else count % cols
+        row_x_offset = ((cols - row_count) * (unit_w + gap_mm)) / 2  # 행 중앙 정렬
+        for c in range(row_count):
+            x = row_x_offset + c * (unit_w + gap_mm)
+            y = r * (unit_d + gap_mm)
+            units.append((x, y, 0.0))
+            idx += 1
+    return [units]
+
+
+def _cluster_bounding_box(
+    cx: float, cy: float,
+    units: list[tuple[float, float, float]],
+    unit_w: float, unit_d: float,
+) -> tuple[float, float, float, float]:
+    """클러스터 전체의 bounding box 반환 (minx, miny, maxx, maxy). cx/cy는 클러스터 중심."""
+    if not units:
+        return cx, cy, cx, cy
+    xs = [cx + rx - unit_w / 2 for rx, _, _ in units] + \
+         [cx + rx + unit_w / 2 for rx, _, _ in units]
+    ys = [cy + ry - unit_d / 2 for _, ry, _ in units] + \
+         [cy + ry + unit_d / 2 for _, ry, _ in units]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _cluster_center_offset(units: list[tuple[float, float, float]]) -> tuple[float, float]:
+    """유닛 상대좌표 리스트의 기하학적 중심 오프셋 반환."""
+    if not units:
+        return 0.0, 0.0
+    cx = sum(rx for rx, _, _ in units) / len(units)
+    cy = sum(ry for _, ry, _ in units) / len(units)
+    return cx, cy
+
+
+def try_place_cluster(
+    ref_cx: float, ref_cy: float,
+    units: list[tuple[float, float, float]],
+    unit_w: float, unit_d: float,
+    room_poly: Polygon,
+    dead_zones: list[Polygon],
+    placed_polys: list[Polygon],
+    corridor_graph: nx.Graph | None = None,
+    entrance_pos: tuple[float, float] | None = None,
+    clearspace_mm: float = MIN_ACCESS_GAP_MM,
+    gap_mm: float = 50.0,
+) -> tuple[list[tuple[Polygon, float, float]] | None, float, float]:
+    """
+    클러스터 전체를 하나의 단위로 배치.
+    반환: ([(poly, cx, cy), ...] | None, cluster_cx, cluster_cy)
+
+    전략:
+    1. 벽 인접(wall_snap): 4방향 벽에 클러스터 뒷면을 붙여 시도
+    2. 실패 시 기준점 주변 그리드 스캔 (중앙 배치)
+
+    접근성 보장:
+    - 2행 배치면 앞면(y=miny 방향) clearspace_mm 통로 필수
+    - 1행 배치면 앞·뒷면 중 하나 clearspace_mm 통로 필수
+    """
+    minx_r, miny_r, maxx_r, maxy_r = room_poly.bounds
+
+    # 클러스터 상대좌표의 기하 중심을 기준점에 맞추기 위한 오프셋
+    oc_x, oc_y = _cluster_center_offset(units)
+
+    def _build_polys(cluster_cx: float, cluster_cy: float):
+        polys = []
+        for rx, ry, rot in units:
+            ux = cluster_cx + rx - oc_x
+            uy = cluster_cy + ry - oc_y
+            polys.append((make_object_polygon(ux, uy, unit_w, unit_d, rot), ux, uy))
+        return polys
+
+    def _is_valid(cluster_cx: float, cluster_cy: float) -> bool:
+        built = _build_polys(cluster_cx, cluster_cy)
+        all_polys_for_cluster = [p for p, _, _ in built]
+
+        # 1) 모든 유닛이 방 안에 있고, dead_zone/placed_poly와 충돌 없음
+        for poly, ux, uy in built:
+            if not room_poly.contains(poly):
+                return False
+            if any(poly.intersects(dz) for dz in dead_zones):
+                return False
+            if any(poly.intersects(pp) for pp in placed_polys):
+                return False
+
+        # 2) 클러스터 전체 bounding box 앞면(miny 방향) 통로 확보
+        bminx, bminy, bmaxx, bmaxy = (
+            min(p.bounds[0] for p in all_polys_for_cluster),
+            min(p.bounds[1] for p in all_polys_for_cluster),
+            max(p.bounds[2] for p in all_polys_for_cluster),
+            max(p.bounds[3] for p in all_polys_for_cluster),
+        )
+        aisle = box(bminx, bminy - clearspace_mm, bmaxx, bminy)
+        aisle_ok = room_poly.contains(aisle) and \
+                   not any(aisle.intersects(pp) for pp in placed_polys) and \
+                   not any(aisle.intersects(dz) for dz in dead_zones)
+
+        if not aisle_ok:
+            # 뒷면 통로로 대안 시도
+            aisle_back = box(bminx, bmaxy, bmaxx, bmaxy + clearspace_mm)
+            aisle_ok = room_poly.contains(aisle_back) and \
+                       not any(aisle_back.intersects(pp) for pp in placed_polys) and \
+                       not any(aisle_back.intersects(dz) for dz in dead_zones)
+
+        if not aisle_ok:
+            return False
+
+        # 3) corridor 연결성 체크 (비용이 크므로 마지막에)
+        if corridor_graph is not None and entrance_pos is not None:
+            combined = all_polys_for_cluster[0]
+            for p in all_polys_for_cluster[1:]:
+                combined = combined.union(p)
+            if not _corridor_ok(corridor_graph, combined, entrance_pos, placed_polys):
+                return False
+
+        return True
+
+    # ── 전략 1: 벽 인접 (wall_snap) ────────────────────────────
+    # 클러스터의 bounding box 높이(y 방향 폭) 계산
+    dummy = _build_polys(ref_cx, ref_cy)
+    if dummy:
+        all_dummy = [p for p, _, _ in dummy]
+        _, d_miny, _, d_maxy = (
+            min(p.bounds[0] for p in all_dummy),
+            min(p.bounds[1] for p in all_dummy),
+            max(p.bounds[2] for p in all_dummy),
+            max(p.bounds[3] for p in all_dummy),
+        )
+        cluster_h = d_maxy - d_miny  # bounding box 높이
+        cluster_w = max(p.bounds[2] for p in all_dummy) - min(p.bounds[0] for p in all_dummy)
+    else:
+        cluster_h = unit_d
+        cluster_w = unit_w
+
+    wall_candidates: list[tuple[float, float]] = [
+        # 북벽 인접: 클러스터 중심 y = miny_r + cluster_h/2
+        (ref_cx, miny_r + cluster_h / 2 + gap_mm),
+        # 남벽 인접
+        (ref_cx, maxy_r - cluster_h / 2 - gap_mm),
+        # 서벽 인접
+        (minx_r + cluster_w / 2 + gap_mm, ref_cy),
+        # 동벽 인접
+        (maxx_r - cluster_w / 2 - gap_mm, ref_cy),
+    ]
+
+    for wcx, wcy in wall_candidates:
+        if _is_valid(wcx, wcy):
+            built = _build_polys(wcx, wcy)
+            return built, wcx, wcy
+
+    # ── 전략 2: 기준점 주변 그리드 스캔 ────────────────────────
+    step = GRID_STEP_MM
+    half_w = cluster_w / 2
+    half_h = cluster_h / 2
+
+    candidates: list[tuple[float, float, float]] = []
+    scan_x = minx_r + half_w
+    while scan_x <= maxx_r - half_w:
+        scan_y = miny_r + half_h
+        while scan_y <= maxy_r - half_h:
+            if _is_valid(scan_x, scan_y):
+                dist = math.sqrt((scan_x - ref_cx) ** 2 + (scan_y - ref_cy) ** 2)
+                disp = _min_placed_distance(scan_x, scan_y, placed_polys)
+                score = disp * 0.7 - dist * 0.3
+                candidates.append((score, scan_x, scan_y))
+            scan_y += step
+        scan_x += step
+
+    if not candidates:
+        return None, ref_cx, ref_cy
+
+    candidates.sort(key=lambda c: -c[0])
+    best_score, best_cx, best_cy = candidates[0]
+    built = _build_polys(best_cx, best_cy)
+    return built, best_cx, best_cy
+
+
+def _split_pd_intents_into_groups(
+    pd_intents: list,
+) -> list[list]:
+    """
+    product_display PlacementIntent 목록을 클러스터 그룹으로 분리.
+    - LLM이 서로 다른 reference_point를 지정했으면 그 기준으로 분리
+    - 모두 같은 reference_point이고 N≥7이면 절반씩 강제 분리
+    """
+    from collections import defaultdict
+    groups_by_ref: dict[str, list] = defaultdict(list)
+    for intent in pd_intents:
+        groups_by_ref[intent.reference_point].append(intent)
+
+    groups = list(groups_by_ref.values())
+
+    # 단일 그룹에 7개 이상이면 절반씩 재분리
+    final_groups = []
+    for group in groups:
+        if len(group) >= 7:
+            half = len(group) // 2
+            final_groups.append(group[:half])
+            final_groups.append(group[half:])
+        else:
+            final_groups.append(group)
+
+    return final_groups
+
+
 def compute_layout(
     floor: FloorAnalysis,
     standards: BrandStandards,
@@ -326,7 +566,87 @@ def compute_layout(
         key=lambda p: (OBJECT_PRIORITY.get(p.object_type, 10), p.priority),
     )
 
-    for intent in sorted_placements:
+    # ── product_display 클러스터 배치 ──────────────────────────────
+    pd_intents = [p for p in sorted_placements if p.object_type == "product_display"]
+    other_intents = [p for p in sorted_placements if p.object_type != "product_display"]
+
+    if pd_intents and "product_display" in furniture_sizes:
+        pd_w, pd_d = furniture_sizes["product_display"]
+        pd_height = (
+            standards.furniture_heights_mm.get("product_display")
+            or DEFAULT_FURNITURE_HEIGHTS.get("product_display", 1500.0)
+        )
+        pd_groups = _split_pd_intents_into_groups(pd_intents)
+
+        for group in pd_groups:
+            # 그룹 내 첫 번째 인텐트의 reference_point를 클러스터 기준점으로 사용
+            try:
+                ref_pos = get_reference_position(floor, group[0].reference_point)
+            except ValueError as e:
+                for intent in group:
+                    failed_objects.append({
+                        "object_type": "product_display",
+                        "reason": str(e),
+                        "reference_point": intent.reference_point,
+                    })
+                continue
+
+            # 클러스터 형태 결정 (서브클러스터 목록 반환)
+            sub_clusters = plan_cluster_layout(len(group), pd_w, pd_d)
+
+            intent_idx = 0
+            for sub_units in sub_clusters:
+                sub_count = len(sub_units)
+                sub_group = group[intent_idx: intent_idx + sub_count]
+                intent_idx += sub_count
+
+                result_units, cluster_cx, cluster_cy = try_place_cluster(
+                    ref_pos[0], ref_pos[1],
+                    sub_units, pd_w, pd_d,
+                    room_poly, dead_zones, placed_polys,
+                    corridor_graph=corridor_graph,
+                    entrance_pos=entrance_pos,
+                    clearspace_mm=max(standards.clearspace_mm, MIN_ACCESS_GAP_MM),
+                )
+
+                if result_units is None:
+                    for intent in sub_group:
+                        failed_objects.append({
+                            "object_type": "product_display",
+                            "reason": f"클러스터 배치 실패 — 방 전체 스캔에서 접근성을 만족하는 공간 없음",
+                            "reference_point": intent.reference_point,
+                        })
+                    continue
+
+                for (poly, ux, uy), intent in zip(result_units, sub_group):
+                    violations: list[Violation] = []
+                    violations += check_dead_zone_intrusion(poly, dead_zones, "product_display")
+                    if emergency_exits:
+                        violations += check_emergency_path(
+                            poly, emergency_exits, "product_display",
+                            standards.emergency_path_min_mm,
+                        )
+                    has_blocking = any(v.severity == ViolationSeverity.BLOCKING for v in violations)
+                    if has_blocking:
+                        failed_objects.append({
+                            "object_type": "product_display",
+                            "reason": "; ".join(v.detail for v in violations if v.severity == ViolationSeverity.BLOCKING),
+                            "reference_point": intent.reference_point,
+                        })
+                        continue
+                    all_violations.extend(violations)
+                    placed_polys.append(poly)
+                    placed_objects.append(PlacedObject(
+                        object_type="product_display",
+                        position_mm=(ux, uy),
+                        rotation_deg=0.0,
+                        bbox_mm=(pd_w, pd_d),
+                        height_mm=pd_height,
+                        reference_point=intent.reference_point,
+                        placed_because=intent.placed_because,
+                    ))
+
+    for intent in other_intents:
         # 오브젝트 크기 조회
         if intent.object_type not in furniture_sizes:
             failed_objects.append({
