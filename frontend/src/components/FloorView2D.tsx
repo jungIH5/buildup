@@ -24,6 +24,7 @@ interface FloorView2DProps {
   walls?: Wall[];
   selectedIndex?: number | null;
   onObjectClick?: (index: number | null) => void;
+  onObjectRotate?: (index: number, deltaDeg: number) => void;
 }
 
 const OBJECT_COLORS: Record<string, string> = {
@@ -48,7 +49,7 @@ const SVG_H   = 600;
 
 const FloorView2D: React.FC<FloorView2DProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
-  selectedIndex, onObjectClick,
+  selectedIndex, onObjectClick, onObjectRotate,
 }) => {
   const { scale, minX, minY, toSVG } = useMemo(() => {
     if (roomPolygon.length === 0) {
@@ -136,6 +137,7 @@ const FloorView2D: React.FC<FloorView2DProps> = ({
               key={`obj-${i}`}
               transform={`translate(${cx}, ${cy}) rotate(${obj.rotation_deg})`}
               onClick={(e) => { e.stopPropagation(); onObjectClick?.(selectedIndex === i ? null : i); }}
+              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (selectedIndex === i) onObjectRotate?.(i, 45); }}
               style={{ cursor: 'pointer' }}
             >
               <rect

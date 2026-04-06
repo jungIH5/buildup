@@ -993,6 +993,9 @@ def _generate_dead_zones(
                 (mx + r / 2, my - r),
                 (mx - r / 2, my - r),
             ])
+        elif eq.equipment_type == "sprinkler":
+            # 스프링클러는 Dead Zone 미적용 — 천장 설비로 바닥 배치에 영향 없음
+            continue
         else:
             radius = standards.wall_clearance_mm
             dead_zones.append([

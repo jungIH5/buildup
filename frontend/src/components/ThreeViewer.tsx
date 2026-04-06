@@ -42,6 +42,7 @@ interface ThreeViewerProps {
   onWallClick?: (id: string | null) => void;
   onObjectMove?: (index: number, x: number, z: number) => void;
   onWallMove?: (id: string, x: number, z: number) => void;
+  onObjectRotate?: (index: number, deltaDeg: number) => void;
 }
 
 const OBJECT_COLORS: Record<string, number> = {
@@ -55,7 +56,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
   floorPlanUrl, roomBboxPx, imageSizePx,
   selectedIndex, selectedWallId,
-  onObjectClick, onWallClick, onObjectMove, onWallMove,
+  onObjectClick, onWallClick, onObjectMove, onWallMove, onObjectRotate,
 }) => {
   const mountRef      = useRef<HTMLDivElement>(null);
   const placedMeshes  = useRef<THREE.Mesh[]>([]);
@@ -66,11 +67,15 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
   const cbWallClick      = useRef(onWallClick);
   const cbObjectMove     = useRef(onObjectMove);
   const cbWallMove       = useRef(onWallMove);
+  const cbObjectRotate   = useRef(onObjectRotate);
+  const selectedIndexRef  = useRef(selectedIndex);
   const selectedWallIdRef = useRef(selectedWallId);
   useEffect(() => { cbObjectClick.current     = onObjectClick;  }, [onObjectClick]);
   useEffect(() => { cbWallClick.current       = onWallClick;    }, [onWallClick]);
   useEffect(() => { cbObjectMove.current      = onObjectMove;   }, [onObjectMove]);
   useEffect(() => { cbWallMove.current        = onWallMove;     }, [onWallMove]);
+  useEffect(() => { cbObjectRotate.current    = onObjectRotate; }, [onObjectRotate]);
+  useEffect(() => { selectedIndexRef.current  = selectedIndex;  }, [selectedIndex]);
   useEffect(() => { selectedWallIdRef.current = selectedWallId; }, [selectedWallId]);
 
   // ── Highlight: placed objects ──
@@ -338,10 +343,20 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       renderer.domElement.style.cursor = 'pointer';
     };
 
+    // ── 우클릭 회전 (45°) ──
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+      const idx = selectedIndexRef.current;
+      if (idx != null && idx >= 0) {
+        cbObjectRotate.current?.(idx, 45);
+      }
+    };
+
     renderer.domElement.style.cursor = 'pointer';
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerup',   onPointerUp);
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     // ── Resize ──
     const onResize = () => {
@@ -362,6 +377,7 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerup',   onPointerUp);
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
       cancelAnimationFrame(animId);
       mount.removeChild(renderer.domElement);
       geos.forEach(g => g.dispose());

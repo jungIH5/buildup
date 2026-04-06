@@ -3,7 +3,7 @@ import axios from 'axios';
 import {
   Upload, Layout, AlertCircle, ArrowRight, Settings,
   Package, Layers, Box, RotateCcw, Trash2, PlusSquare,
-  Undo2, RefreshCw, Send, ChevronDown, ChevronUp,
+  Undo2, RefreshCw, Send, ChevronDown, ChevronUp, RotateCw,
 } from 'lucide-react';
 import './globals.css';
 
@@ -191,6 +191,14 @@ const App: React.FC = () => {
     });
   };
 
+  // ── Object rotate ──
+  const handleObjectRotate = (index: number, deltaDeg: number) => {
+    setLocalPlaced(prev => {
+      pushHistory(prev, walls);
+      return prev.map((p, i) => i === index ? { ...p, rotation_deg: (p.rotation_deg + deltaDeg + 360) % 360 } : p);
+    });
+  };
+
   // ── Wall callbacks ──
   const handleWallMove   = (id: string, x: number, z: number) => setWalls(prev => { pushHistory(localPlaced, prev); return prev.map(w => w.id === id ? { ...w, x, z } : w); });
   const handleWallRotate = (id: string) => setWalls(prev => { pushHistory(localPlaced, prev); return prev.map(w => w.id === id ? { ...w, rotation: (w.rotation + 90) % 360 } : w); });
@@ -304,47 +312,78 @@ const App: React.FC = () => {
                     </div>
                   </div>
                 </label>
+
+                {/* 배치 요구사항 */}
+                <div>
+                  <div className="text-xs text-text-muted mb-1 flex items-center gap-1">
+                    <Send size={11} className="text-accent" /> 배치 요구사항
+                    <span className="ml-1 text-[10px] opacity-60">(선택)</span>
+                  </div>
+                  <textarea
+                    className="w-full bg-black/20 border border-border rounded-xl p-2.5 text-xs text-text-main
+                               placeholder-text-muted resize-none focus:outline-none focus:border-accent/60 transition-colors"
+                    rows={3}
+                    placeholder={"예) 상품진열대를 벽 쪽에 4개, 중앙에 2개 배치해주세요.\n포토존은 입구 정면에 놓아주세요."}
+                    value={reqText}
+                    onChange={e => setReqText(e.target.value)}
+                  />
+                </div>
+
+                {/* 분석 시작 버튼 (결과 없을 때) */}
+                {!result && (
+                  <button
+                    onClick={handleProcess}
+                    disabled={!canAnalyze}
+                    className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl
+                               bg-primary text-white text-sm font-bold
+                               hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isProcessing ? (
+                      <><RefreshCw size={14} className="animate-spin" /> AI 분석 중...</>
+                    ) : (
+                      <><ArrowRight size={14} /> 분석 시작하기</>
+                    )}
+                  </button>
+                )}
               </div>
             )}
           </div>
 
-          {/* 요구사항 입력 */}
-          <div className="px-4 py-3 border-b border-border">
-            <div className="text-xs text-text-muted mb-2 flex items-center gap-1">
-              <Send size={11} className="text-accent" /> 배치 요구사항
-              <span className="ml-1 text-[10px] opacity-60">(선택)</span>
-            </div>
-
-            {/* 누적 요구사항 칩 */}
-            {appliedReqs.length > 0 && (
-              <div className="flex flex-wrap gap-1 mb-2">
-                {appliedReqs.map((req, idx) => (
-                  <span key={idx}
-                    className="flex items-center gap-1 bg-accent/10 border border-accent/30
-                               text-accent text-[10px] px-2 py-0.5 rounded-full max-w-full">
-                    <span className="truncate max-w-[160px]" title={req}>{req}</span>
-                    <button
-                      onClick={() => {
-                        const next = appliedReqs.filter((_, i) => i !== idx);
-                        setAppliedReqs(next);
-                        handleRegenerate(next.join('\n') || null);
-                      }}
-                      className="shrink-0 text-accent/60 hover:text-accent leading-none ml-0.5">×</button>
-                  </span>
-                ))}
+          {/* 요구사항 적용 버튼 (결과 있을 때) */}
+          {result && (
+            <div className="px-4 py-3 border-b border-border">
+              <div className="text-xs text-text-muted mb-2 flex items-center gap-1">
+                <Send size={11} className="text-accent" /> 배치 요구사항
               </div>
-            )}
 
-            <textarea
-              className="w-full bg-black/20 border border-border rounded-xl p-2.5 text-xs text-text-main
-                         placeholder-text-muted resize-none focus:outline-none focus:border-accent/60 transition-colors"
-              rows={3}
-              placeholder={"예) 상품진열대를 벽 쪽에 4개, 중앙에 2개 배치해주세요.\n포토존은 입구 정면에 놓아주세요."}
-              value={reqText}
-              onChange={e => setReqText(e.target.value)}
-            />
-            {/* 분석하기 / 요구사항 적용 버튼 */}
-            {result ? (
+              {/* 누적 요구사항 칩 */}
+              {appliedReqs.length > 0 && (
+                <div className="flex flex-wrap gap-1 mb-2">
+                  {appliedReqs.map((req, idx) => (
+                    <span key={idx}
+                      className="flex items-center gap-1 bg-accent/10 border border-accent/30
+                                 text-accent text-[10px] px-2 py-0.5 rounded-full max-w-full">
+                      <span className="truncate max-w-[160px]" title={req}>{req}</span>
+                      <button
+                        onClick={() => {
+                          const next = appliedReqs.filter((_, i) => i !== idx);
+                          setAppliedReqs(next);
+                          handleRegenerate(next.join('\n') || null);
+                        }}
+                        className="shrink-0 text-accent/60 hover:text-accent leading-none ml-0.5">×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <textarea
+                className="w-full bg-black/20 border border-border rounded-xl p-2.5 text-xs text-text-main
+                           placeholder-text-muted resize-none focus:outline-none focus:border-accent/60 transition-colors"
+                rows={3}
+                placeholder={"예) 상품진열대를 벽 쪽에 4개, 중앙에 2개 배치해주세요.\n포토존은 입구 정면에 놓아주세요."}
+                value={reqText}
+                onChange={e => setReqText(e.target.value)}
+              />
               <div className="flex gap-2 mt-2">
                 <button
                   onClick={() => {
@@ -372,22 +411,8 @@ const App: React.FC = () => {
                   <RefreshCw size={12} className={isProcessing ? 'animate-spin' : ''} />
                 </button>
               </div>
-            ) : (
-              <button
-                onClick={handleProcess}
-                disabled={!canAnalyze}
-                className="w-full mt-2 flex items-center justify-center gap-1.5 py-2.5 rounded-xl
-                           bg-primary text-white text-sm font-bold
-                           hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              >
-                {isProcessing ? (
-                  <><RefreshCw size={14} className="animate-spin" /> AI 분석 중...</>
-                ) : (
-                  <><ArrowRight size={14} /> 분석 시작하기</>
-                )}
-              </button>
-            )}
-          </div>
+            </div>
+          )}
 
           {/* 분석 완료 후 패널들 */}
           {result && (
@@ -458,9 +483,32 @@ const App: React.FC = () => {
                           {p.reference_point} · {p.bbox_mm[0]}×{p.bbox_mm[1]} (H{p.height_mm})
                         </div>
                         {isSel && (
-                          <div className="text-[10px] text-text-muted mt-1 pl-4 leading-relaxed border-t border-white/5 pt-1">
-                            {p.placed_because}
-                          </div>
+                          <>
+                            <div className="flex items-center gap-1.5 mt-1.5 pl-4">
+                              <span className="text-[10px] text-text-muted">{p.rotation_deg}°</span>
+                              <button
+                                onClick={e => { e.stopPropagation(); handleObjectRotate(i, -45); }}
+                                className="p-1 rounded hover:bg-white/10 text-text-muted hover:text-white"
+                                title="반시계 45°">
+                                <RotateCcw size={11} />
+                              </button>
+                              <button
+                                onClick={e => { e.stopPropagation(); handleObjectRotate(i, 45); }}
+                                className="p-1 rounded hover:bg-white/10 text-text-muted hover:text-white"
+                                title="시계 45°">
+                                <RotateCw size={11} />
+                              </button>
+                              <button
+                                onClick={e => { e.stopPropagation(); handleObjectRotate(i, 90); }}
+                                className="px-1.5 py-0.5 rounded text-[10px] hover:bg-white/10 text-text-muted hover:text-white border border-white/10"
+                                title="90° 회전">
+                                90°
+                              </button>
+                            </div>
+                            <div className="text-[10px] text-text-muted mt-1 pl-4 leading-relaxed border-t border-white/5 pt-1">
+                              {p.placed_because}
+                            </div>
+                          </>
                         )}
                       </button>
                     );
@@ -584,6 +632,7 @@ const App: React.FC = () => {
                   onWallClick={id => { setSelectedWallId(p => p === id ? null : id); setSelectedObjectIndex(null); }}
                   onObjectMove={handleObjectMove}
                   onWallMove={handleWallMove}
+                  onObjectRotate={handleObjectRotate}
                 />
               ) : (
                 <FloorView2D
@@ -593,6 +642,7 @@ const App: React.FC = () => {
                   walls={walls}
                   selectedIndex={selectedObjectIndex}
                   onObjectClick={idx => { setSelectedObjectIndex(p => p === idx ? null : idx); setSelectedWallId(null); }}
+                  onObjectRotate={handleObjectRotate}
                 />
               )
             ) : (
