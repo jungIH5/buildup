@@ -22,8 +22,8 @@ interface FloorView2DProps {
   placedObjects: PlacedObject[];
   detectedObjects?: DetectedObject[];
   walls?: Wall[];
-  selectedIndex?: number | null;
-  onObjectClick?: (index: number | null) => void;
+  selectedIndices?: number[];
+  onObjectClick?: (index: number | null, shiftKey?: boolean) => void;
   onObjectRotate?: (index: number, deltaDeg: number) => void;
 }
 
@@ -49,7 +49,7 @@ const SVG_H   = 600;
 
 const FloorView2D: React.FC<FloorView2DProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
-  selectedIndex, onObjectClick, onObjectRotate,
+  selectedIndices = [], onObjectClick, onObjectRotate,
 }) => {
   const { scale, minX, minY, toSVG } = useMemo(() => {
     if (roomPolygon.length === 0) {
@@ -123,12 +123,63 @@ const FloorView2D: React.FC<FloorView2DProps> = ({
           );
         })}
 
+        {/* 사람 모형 (스케일 레퍼런스) — 입구 바로 앞에 고정, 방 밖이어도 무관 */}
+        {(() => {
+          const xs = roomPolygon.map(p => p[0]);
+          const ys = roomPolygon.map(p => p[1]);
+          const rcx = (Math.min(...xs) + Math.max(...xs)) / 2;
+
+          // 입구가 있으면 입구 위치 그대로, 없으면 방 남쪽 외부
+          const entrance = detectedObjects.find(o =>
+            o.equipment_type === 'exit' || o.equipment_type === 'emergency_exit'
+          );
+          let px: number, py: number;
+          if (entrance?.position_mm) {
+            [px, py] = entrance.position_mm;
+          } else {
+            px = rcx;
+            py = Math.max(...ys) + 500; // 방 남쪽 바깥
+          }
+
+          const [svgX, svgY] = toSVG(px, py);
+          const bodyW = 450 * scale, bodyH = 1500 * scale;
+          const headR = 150 * scale;
+
+          return (
+            <g key="person-ref" opacity={0.75}>
+              {/* 몸통 */}
+              <rect
+                x={svgX - bodyW / 2} y={svgY - bodyH / 2}
+                width={bodyW} height={bodyH}
+                fill="#e2e8f0" fillOpacity={0.25}
+                stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 2" rx="3"
+              />
+              {/* 머리 */}
+              <circle
+                cx={svgX} cy={svgY - bodyH / 2 - headR}
+                r={headR}
+                fill="#e2e8f0" fillOpacity={0.25}
+                stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 2"
+              />
+              {/* 레이블 */}
+              <text
+                x={svgX + bodyW / 2 + 6} y={svgY - bodyH / 2 - headR * 2}
+                fontSize="9" fill="#94a3b8" fontWeight="bold"
+              >↕ 180cm</text>
+              <text
+                x={svgX + bodyW / 2 + 6} y={svgY - bodyH / 2 - headR * 2 + 11}
+                fontSize="8" fill="#64748b"
+              >스케일 기준</text>
+            </g>
+          );
+        })()}
+
         {/* AI 배치 오브젝트 */}
         {placedObjects.map((obj, i) => {
           const [cx, cy] = toSVG(obj.position_mm[0], obj.position_mm[1]);
           const w  = obj.bbox_mm[0] * scale;
           const d  = obj.bbox_mm[1] * scale;
-          const isSelected = selectedIndex === i;
+          const isSelected = selectedIndices.includes(i);
           const color = OBJECT_COLORS[obj.object_type] ?? '#ec4899';
           const name  = OBJECT_NAMES[obj.object_type]  ?? obj.object_type;
 
@@ -136,8 +187,8 @@ const FloorView2D: React.FC<FloorView2DProps> = ({
             <g
               key={`obj-${i}`}
               transform={`translate(${cx}, ${cy}) rotate(${obj.rotation_deg})`}
-              onClick={(e) => { e.stopPropagation(); onObjectClick?.(selectedIndex === i ? null : i); }}
-              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (selectedIndex === i) onObjectRotate?.(i, 45); }}
+              onClick={(e) => { e.stopPropagation(); onObjectClick?.(selectedIndices.includes(i) && !e.shiftKey ? null : i, e.shiftKey); }}
+              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (selectedIndices.includes(i)) onObjectRotate?.(i, 45); }}
               style={{ cursor: 'pointer' }}
             >
               <rect

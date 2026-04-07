@@ -36,11 +36,12 @@ interface ThreeViewerProps {
   floorPlanUrl?: string;
   roomBboxPx?: [number, number, number, number];
   imageSizePx?: [number, number];
-  selectedIndex?: number | null;
+  selectedIndices?: number[];
   selectedWallId?: string | null;
-  onObjectClick?: (index: number | null) => void;
+  onObjectClick?: (index: number | null, shiftKey?: boolean) => void;
   onWallClick?: (id: string | null) => void;
   onObjectMove?: (index: number, x: number, z: number) => void;
+  onObjectMoveMulti?: (moves: { index: number; x: number; z: number }[]) => void;
   onWallMove?: (id: string, x: number, z: number) => void;
   onObjectRotate?: (index: number, deltaDeg: number) => void;
 }
@@ -55,38 +56,45 @@ const WALL_COLOR     = 0x94a3b8;
 const ThreeViewer: React.FC<ThreeViewerProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
   floorPlanUrl, roomBboxPx, imageSizePx,
-  selectedIndex, selectedWallId,
-  onObjectClick, onWallClick, onObjectMove, onWallMove, onObjectRotate,
+  selectedIndices = [], selectedWallId,
+  onObjectClick, onWallClick, onObjectMove, onObjectMoveMulti, onWallMove, onObjectRotate,
 }) => {
   const mountRef      = useRef<HTMLDivElement>(null);
   const placedMeshes  = useRef<THREE.Mesh[]>([]);
   const wallMeshes    = useRef<THREE.Mesh[]>([]);
+  const personGroup   = useRef<THREE.Group | null>(null);
+  const personPos     = useRef<{ x: number; z: number } | null>(null);
+  // 카메라 상태 ref — 씬 재빌드 시 복원
+  const cameraState   = useRef<{ pos: THREE.Vector3; target: THREE.Vector3 } | null>(null);
 
   // Callback refs (always current in event closures)
   const cbObjectClick    = useRef(onObjectClick);
   const cbWallClick      = useRef(onWallClick);
-  const cbObjectMove     = useRef(onObjectMove);
+  const cbObjectMove      = useRef(onObjectMove);
+  const cbObjectMoveMulti = useRef(onObjectMoveMulti);
   const cbWallMove       = useRef(onWallMove);
-  const cbObjectRotate   = useRef(onObjectRotate);
-  const selectedIndexRef  = useRef(selectedIndex);
-  const selectedWallIdRef = useRef(selectedWallId);
-  useEffect(() => { cbObjectClick.current     = onObjectClick;  }, [onObjectClick]);
-  useEffect(() => { cbWallClick.current       = onWallClick;    }, [onWallClick]);
-  useEffect(() => { cbObjectMove.current      = onObjectMove;   }, [onObjectMove]);
-  useEffect(() => { cbWallMove.current        = onWallMove;     }, [onWallMove]);
-  useEffect(() => { cbObjectRotate.current    = onObjectRotate; }, [onObjectRotate]);
-  useEffect(() => { selectedIndexRef.current  = selectedIndex;  }, [selectedIndex]);
-  useEffect(() => { selectedWallIdRef.current = selectedWallId; }, [selectedWallId]);
+  const cbObjectRotate    = useRef(onObjectRotate);
+  const selectedIndicesRef = useRef(selectedIndices);
+  const selectedWallIdRef  = useRef(selectedWallId);
+  useEffect(() => { cbObjectClick.current      = onObjectClick;   }, [onObjectClick]);
+  useEffect(() => { cbWallClick.current        = onWallClick;     }, [onWallClick]);
+  useEffect(() => { cbObjectMove.current       = onObjectMove;       }, [onObjectMove]);
+  useEffect(() => { cbObjectMoveMulti.current  = onObjectMoveMulti;  }, [onObjectMoveMulti]);
+  useEffect(() => { cbWallMove.current         = onWallMove;      }, [onWallMove]);
+  useEffect(() => { cbObjectRotate.current     = onObjectRotate;  }, [onObjectRotate]);
+  useEffect(() => { selectedIndicesRef.current = selectedIndices; }, [selectedIndices]);
+  useEffect(() => { selectedWallIdRef.current  = selectedWallId;  }, [selectedWallId]);
 
   // ── Highlight: placed objects ──
   useEffect(() => {
     placedMeshes.current.forEach((mesh, i) => {
       const mat = mesh.material as THREE.MeshStandardMaterial;
-      mat.color.setHex(i === selectedIndex ? SELECTED_COLOR : (OBJECT_COLORS[placedObjects[i]?.object_type] ?? 0xec4899));
-      mat.emissive.setHex(i === selectedIndex ? 0x554400 : 0x000000);
+      const isSel = selectedIndices.includes(i);
+      mat.color.setHex(isSel ? SELECTED_COLOR : (OBJECT_COLORS[placedObjects[i]?.object_type] ?? 0xec4899));
+      mat.emissive.setHex(isSel ? 0x554400 : 0x000000);
       mat.needsUpdate = true;
     });
-  }, [selectedIndex, placedObjects]);
+  }, [selectedIndices, placedObjects]);
 
   // ── Highlight: walls ──
   useEffect(() => {
@@ -127,6 +135,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.target.set(cx, 0, cz);
+
+    // 이전 씬 재빌드 시 카메라 상태 복원
+    if (cameraState.current) {
+      camera.position.copy(cameraState.current.pos);
+      controls.target.copy(cameraState.current.target);
+    }
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.9));
     const dir = new THREE.DirectionalLight(0xffffff, 1);
@@ -210,11 +224,79 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       }
     });
 
+    // ── 사람 모형 (스케일 레퍼런스, 드래그 가능) ──
+    {
+      // 이전 드래그 위치가 있으면 유지, 없으면 입구 기준 초기 배치
+      let personX: number, personZ: number;
+      if (personPos.current) {
+        personX = personPos.current.x;
+        personZ = personPos.current.z;
+      } else {
+        personX = cx; personZ = maxY - 1200;
+        const entrance = detectedObjects.find(o =>
+          o.equipment_type === 'exit' || o.equipment_type === 'emergency_exit'
+        );
+        if (entrance?.position_mm) {
+          const [ex, ez] = entrance.position_mm;
+          const dx = cx - ex, dz = cz - ez;
+          const dist = Math.sqrt(dx * dx + dz * dz) || 1;
+          personX = ex + (dx / dist) * 1200;
+          personZ = ez + (dz / dist) * 1200;
+        }
+        personPos.current = { x: personX, z: personZ };
+      }
+
+      const BODY_H = 1500, HEAD_R = 150, BODY_W = 450, BODY_D = 300;
+      const personColor = 0xe2e8f0;
+
+      const group = new THREE.Group();
+      group.position.set(personX, 0, personZ);
+      group.userData = { type: 'person' };
+
+      // 몸통
+      const bodyGeo = new THREE.BoxGeometry(BODY_W, BODY_H, BODY_D);
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: personColor, transparent: true, opacity: 0.55, roughness: 0.5,
+      });
+      geos.push(bodyGeo); mats.push(bodyMat);
+      const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+      bodyMesh.position.set(0, BODY_H / 2, 0);
+      bodyMesh.userData = { type: 'person' };
+      bodyMesh.add(new THREE.LineSegments(
+        new THREE.EdgesGeometry(bodyGeo),
+        new THREE.LineBasicMaterial({ color: 0x94a3b8, opacity: 0.8, transparent: true })
+      ));
+      group.add(bodyMesh);
+
+      // 머리
+      const headGeo = new THREE.SphereGeometry(HEAD_R, 16, 16);
+      const headMat = new THREE.MeshStandardMaterial({
+        color: personColor, transparent: true, opacity: 0.55, roughness: 0.5,
+      });
+      geos.push(headGeo); mats.push(headMat);
+      const headMesh = new THREE.Mesh(headGeo, headMat);
+      headMesh.position.set(0, BODY_H + HEAD_R, 0);
+      headMesh.userData = { type: 'person' };
+      group.add(headMesh);
+
+      // 키 표시선
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(BODY_W, 0, 0),
+        new THREE.Vector3(BODY_W, BODY_H + HEAD_R * 2, 0),
+      ]);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x94a3b8, opacity: 0.6, transparent: true });
+      geos.push(lineGeo); mats.push(lineMat);
+      group.add(new THREE.Line(lineGeo, lineMat));
+
+      scene.add(group);
+      personGroup.current = group;
+    }
+
     // ── AI 배치 오브젝트 ──
     placedObjects.forEach((obj, i) => {
       const [w,d] = obj.bbox_mm, h = obj.height_mm ?? 1500;
       const geo = new THREE.BoxGeometry(w,h,d);
-      const isSel = i === selectedIndex;
+      const isSel = selectedIndices.includes(i);
       const mat = new THREE.MeshStandardMaterial({
         color: isSel ? SELECTED_COLOR : (OBJECT_COLORS[obj.object_type] ?? 0xec4899),
         emissive: isSel ? 0x554400 : 0x000000,
@@ -255,8 +337,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     const hitPoint     = new THREE.Vector3();
 
     let isDragging    = false;
-    let dragMesh: THREE.Mesh | null = null;
-    let dragType: 'placed' | 'wall' | null = null;
+    let dragType: 'placed' | 'wall' | 'person' | null = null;
+    let dragMesh: THREE.Mesh | null = null;       // placed/wall
+    let dragPersonGrp: THREE.Group | null = null; // person
     let dragIndex     = -1;
     let dragWallId    = '';
     let dragOffset    = { x: 0, z: 0 };
@@ -268,51 +351,86 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       mouse.y = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
     };
 
-    const findDraggable = (e: PointerEvent): THREE.Mesh | null => {
+    // 클릭/드래그 가능한 mesh 탐색 (person 포함)
+    const findDraggable = (e: PointerEvent): THREE.Object3D | null => {
       getMouseNDC(e);
       raycaster.setFromCamera(mouse, camera);
-      const all = [...placedMeshes.current, ...wallMeshes.current];
-      const hits = raycaster.intersectObjects(all, true);
+      const targets = [
+        ...placedMeshes.current,
+        ...wallMeshes.current,
+        ...(personGroup.current ? personGroup.current.children.filter(c => c instanceof THREE.Mesh) as THREE.Mesh[] : []),
+      ];
+      const hits = raycaster.intersectObjects(targets, true);
       if (!hits.length) return null;
       let obj: THREE.Object3D | null = hits[0].object;
       while (obj && !obj.userData.type) obj = obj.parent;
-      return obj as THREE.Mesh ?? null;
+      return obj ?? null;
     };
 
     const onPointerDown = (e: PointerEvent) => {
       downPos = { x: e.clientX, y: e.clientY };
-      const mesh = findDraggable(e);
-      if (!mesh) return;
+      const found = findDraggable(e);
+      if (!found) return;
 
-      // 가벽은 선택된 것만 드래그 가능 — 겹쳐있을 때 의도치 않은 이동 방지
-      if (mesh.userData.type === 'wall' && mesh.userData.wallId !== selectedWallIdRef.current) {
-        // 드래그 시작하지 않음 — pointerup에서 클릭으로 처리
-        downPos = { x: e.clientX, y: e.clientY };
-        return;
-      }
+      // 가벽은 선택된 것만 드래그
+      if (found.userData.type === 'wall' && found.userData.wallId !== selectedWallIdRef.current) return;
 
       getMouseNDC(e);
       raycaster.setFromCamera(mouse, camera);
       raycaster.ray.intersectPlane(floorPlane, hitPoint);
 
       isDragging = true;
-      dragMesh   = mesh;
-      dragType   = mesh.userData.type;
-      if (dragType === 'placed') dragIndex  = mesh.userData.placedIndex;
-      if (dragType === 'wall')   dragWallId = mesh.userData.wallId;
-      dragOffset = { x: hitPoint.x - mesh.position.x, z: hitPoint.z - mesh.position.z };
+      dragType   = found.userData.type;
       controls.enabled = false;
       renderer.domElement.style.cursor = 'grabbing';
+
+      if (dragType === 'person' && personGroup.current) {
+        dragPersonGrp = personGroup.current;
+        dragOffset = { x: hitPoint.x - dragPersonGrp.position.x, z: hitPoint.z - dragPersonGrp.position.z };
+      } else {
+        dragMesh = found as THREE.Mesh;
+        if (dragType === 'placed') dragIndex  = found.userData.placedIndex;
+        if (dragType === 'wall')   dragWallId = found.userData.wallId;
+        dragOffset = { x: hitPoint.x - dragMesh.position.x, z: hitPoint.z - dragMesh.position.z };
+        // delta 추적 초기값 설정
+        prevDragX = dragMesh.position.x;
+        prevDragZ = dragMesh.position.z;
+      }
       e.stopPropagation();
     };
 
+    // 드래그 중 다중 선택 mesh 추적용
+    let prevDragX = 0, prevDragZ = 0;
+
     const onPointerMove = (e: PointerEvent) => {
-      if (!isDragging || !dragMesh) return;
+      if (!isDragging) return;
       getMouseNDC(e);
       raycaster.setFromCamera(mouse, camera);
       raycaster.ray.intersectPlane(floorPlane, hitPoint);
-      dragMesh.position.x = hitPoint.x - dragOffset.x;
-      dragMesh.position.z = hitPoint.z - dragOffset.z;
+
+      if (dragType === 'person' && dragPersonGrp) {
+        dragPersonGrp.position.x = hitPoint.x - dragOffset.x;
+        dragPersonGrp.position.z = hitPoint.z - dragOffset.z;
+      } else if (dragMesh) {
+        const newX = hitPoint.x - dragOffset.x;
+        const newZ = hitPoint.z - dragOffset.z;
+        const ddx = newX - prevDragX;
+        const ddz = newZ - prevDragZ;
+        prevDragX = newX;
+        prevDragZ = newZ;
+
+        const indices = selectedIndicesRef.current;
+        if (indices.length > 1 && indices.includes(dragIndex)) {
+          // 다중 선택: 드래그 mesh 포함 선택된 모든 mesh를 delta만큼 같이 이동
+          indices.forEach(idx => {
+            const m = placedMeshes.current[idx];
+            if (m) { m.position.x += ddx; m.position.z += ddz; }
+          });
+        } else {
+          dragMesh.position.x = newX;
+          dragMesh.position.z = newZ;
+        }
+      }
     };
 
     const onPointerUp = (e: PointerEvent) => {
@@ -320,25 +438,40 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       const dy = Math.abs(e.clientY - downPos.y);
       const wasDrag = dx > 5 || dy > 5;
 
-      if (isDragging && dragMesh && wasDrag) {
-        // 드래그 끝 → 새 위치 emit
-        const nx = dragMesh.position.x, nz = dragMesh.position.z;
-        if (dragType === 'placed') cbObjectMove.current?.(dragIndex, nx, nz);
-        if (dragType === 'wall')   cbWallMove.current?.(dragWallId, nx, nz);
+      if (isDragging && wasDrag) {
+        if (dragType === 'person' && dragPersonGrp) {
+          // 사람 위치 ref에 저장 — 씬 재빌드 시 유지
+          personPos.current = { x: dragPersonGrp.position.x, z: dragPersonGrp.position.z };
+        } else if (dragMesh) {
+          if (dragType === 'placed') {
+            const indices = selectedIndicesRef.current;
+            if (indices.length > 1 && indices.includes(dragIndex)) {
+              // 다중 선택: 한 번에 emit → App에서 pushHistory 1회만 실행
+              const moves = indices.map(idx => {
+                const m = placedMeshes.current[idx];
+                return { index: idx, x: m?.position.x ?? 0, z: m?.position.z ?? 0 };
+              });
+              cbObjectMoveMulti.current?.(moves);
+            } else {
+              cbObjectMove.current?.(dragIndex, dragMesh.position.x, dragMesh.position.z);
+            }
+          }
+          if (dragType === 'wall') cbWallMove.current?.(dragWallId, dragMesh.position.x, dragMesh.position.z);
+        }
       } else if (!wasDrag) {
-        // 클릭
-        const mesh = findDraggable(e);
-        if (!mesh) {
+        const found = findDraggable(e);
+        if (!found) {
           cbObjectClick.current?.(null);
           cbWallClick.current?.(null);
-        } else if (mesh.userData.type === 'placed') {
-          cbObjectClick.current?.(mesh.userData.placedIndex);
-        } else if (mesh.userData.type === 'wall') {
-          cbWallClick.current?.(mesh.userData.wallId);
+        } else if (found.userData.type === 'placed') {
+          cbObjectClick.current?.(found.userData.placedIndex, e.shiftKey);
+        } else if (found.userData.type === 'wall') {
+          cbWallClick.current?.(found.userData.wallId);
         }
+        // person 클릭은 별도 동작 없음
       }
 
-      isDragging = false; dragMesh = null; dragType = null;
+      isDragging = false; dragMesh = null; dragPersonGrp = null; dragType = null;
       controls.enabled = true;
       renderer.domElement.style.cursor = 'pointer';
     };
@@ -346,9 +479,9 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     // ── 우클릭 회전 (45°) ──
     const onContextMenu = (e: MouseEvent) => {
       e.preventDefault();
-      const idx = selectedIndexRef.current;
-      if (idx != null && idx >= 0) {
-        cbObjectRotate.current?.(idx, 45);
+      const indices = selectedIndicesRef.current;
+      if (indices.length > 0) {
+        indices.forEach(idx => cbObjectRotate.current?.(idx, 45));
       }
     };
 
@@ -369,7 +502,16 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
 
     // ── Animate ──
     let animId = 0;
-    const animate = () => { animId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); };
+    const animate = () => {
+      animId = requestAnimationFrame(animate);
+      controls.update();
+      // 카메라 상태 지속 저장 — 씬 재빌드 시 복원용
+      cameraState.current = {
+        pos: camera.position.clone(),
+        target: controls.target.clone(),
+      };
+      renderer.render(scene, camera);
+    };
     animate();
 
     return () => {

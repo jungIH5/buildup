@@ -87,7 +87,9 @@ const App: React.FC = () => {
   // local editable state
   const [localPlaced, setLocalPlaced]               = useState<Placement[]>([]);
   const [walls, setWalls]                           = useState<Wall[]>([]);
-  const [selectedObjectIndex, setSelectedObjectIndex] = useState<number | null>(null);
+  const [selectedObjectIndices, setSelectedObjectIndices] = useState<number[]>([]);
+  const selectedObjectIndicesRef = useRef<number[]>([]);
+  useEffect(() => { selectedObjectIndicesRef.current = selectedObjectIndices; }, [selectedObjectIndices]);
   const [selectedWallId, setSelectedWallId]         = useState<string | null>(null);
   const [viewMode, setViewMode]                     = useState<'3d' | '2d'>('3d');
 
@@ -137,7 +139,7 @@ const App: React.FC = () => {
       setResult(res.data);
       layoutCache.current = res.data._cache ?? null;
       setWalls([]);
-      setSelectedObjectIndex(null);
+      setSelectedObjectIndices([]);
       setSelectedWallId(null);
       if (res.data.floor_plan_png)
         setFloorPlanUrl(`data:image/png;base64,${res.data.floor_plan_png}`);
@@ -172,7 +174,7 @@ const App: React.FC = () => {
         disclaimer_items: res.data.disclaimer_items,
         summary: res.data.summary,
       } : prev);
-      setSelectedObjectIndex(null);
+      setSelectedObjectIndices([]);
       setSelectedWallId(null);
       undoStack.current = [];
     } catch (err) {
@@ -183,11 +185,35 @@ const App: React.FC = () => {
     }
   };
 
-  // ── Object move ──
+  // ── Object move (드래그한 오브젝트 + 함께 선택된 오브젝트들 같이 이동) ──
   const handleObjectMove = (index: number, x: number, z: number) => {
     setLocalPlaced(prev => {
       pushHistory(prev, walls);
-      return prev.map((p, i) => i === index ? { ...p, position_mm: [x, z] as [number, number] } : p);
+      const indices = selectedObjectIndicesRef.current.includes(index)
+        ? selectedObjectIndicesRef.current
+        : [index];
+      if (indices.length === 1) {
+        return prev.map((p, i) => i === index ? { ...p, position_mm: [x, z] as [number, number] } : p);
+      }
+      // 다중 선택: 드래그된 오브젝트의 이동 delta를 다른 선택 오브젝트에도 적용
+      const anchor = prev[index];
+      const dx = x - anchor.position_mm[0];
+      const dz = z - anchor.position_mm[1];
+      return prev.map((p, i) => {
+        if (!indices.includes(i)) return p;
+        return { ...p, position_mm: [p.position_mm[0] + dx, p.position_mm[1] + dz] as [number, number] };
+      });
+    });
+  };
+
+  // ── Object move (다중 선택, 한 번에 undo 스냅샷 1개) ──
+  const handleObjectMoveMulti = (moves: { index: number; x: number; z: number }[]) => {
+    setLocalPlaced(prev => {
+      pushHistory(prev, walls);
+      return prev.map((p, i) => {
+        const m = moves.find(mv => mv.index === i);
+        return m ? { ...p, position_mm: [m.x, m.z] as [number, number] } : p;
+      });
     });
   };
 
@@ -195,7 +221,25 @@ const App: React.FC = () => {
   const handleObjectRotate = (index: number, deltaDeg: number) => {
     setLocalPlaced(prev => {
       pushHistory(prev, walls);
-      return prev.map((p, i) => i === index ? { ...p, rotation_deg: (p.rotation_deg + deltaDeg + 360) % 360 } : p);
+      const indices = selectedObjectIndicesRef.current.includes(index)
+        ? selectedObjectIndicesRef.current
+        : [index];
+      return prev.map((p, i) => indices.includes(i)
+        ? { ...p, rotation_deg: (p.rotation_deg + deltaDeg + 360) % 360 }
+        : p
+      );
+    });
+  };
+
+  // ── Shift 클릭으로 다중 선택 토글 ──
+  const handleObjectClick = (idx: number | null, shiftKey = false) => {
+    if (idx === null) { setSelectedObjectIndices([]); setSelectedWallId(null); return; }
+    setSelectedWallId(null);
+    setSelectedObjectIndices(prev => {
+      if (shiftKey) {
+        return prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx];
+      }
+      return prev.length === 1 && prev[0] === idx ? [] : [idx];
     });
   };
 
@@ -437,7 +481,7 @@ const App: React.FC = () => {
                       const isSel = selectedWallId === wall.id;
                       return (
                         <div key={wall.id}
-                          onClick={() => { setSelectedWallId(p => p === wall.id ? null : wall.id); setSelectedObjectIndex(null); }}
+                          onClick={() => { setSelectedWallId(p => p === wall.id ? null : wall.id); setSelectedObjectIndices([]); }}
                           className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border cursor-pointer transition-all text-xs ${
                             isSel ? 'border-yellow-400/60 bg-yellow-400/10' : 'border-white/5 bg-black/20 hover:bg-white/5'}`}>
                           <span className="font-bold">{(wall.length / 1000).toFixed(0)}m벽 · {wall.rotation}°</span>
@@ -466,18 +510,18 @@ const App: React.FC = () => {
                 </h4>
                 <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
                   {localPlaced.map((p, i) => {
-                    const isSel = selectedObjectIndex === i;
+                    const isSel = selectedObjectIndices.includes(i);
                     const color = OBJECT_COLORS[p.object_type] ?? '#ec4899';
                     const name  = OBJECT_NAMES[p.object_type]  ?? p.object_type;
                     return (
                       <button key={i}
-                        onClick={() => { setSelectedObjectIndex(prev => prev === i ? null : i); setSelectedWallId(null); }}
+                        onClick={e => handleObjectClick(i, e.shiftKey)}
                         className={`w-full text-left px-2.5 py-2 rounded-lg border transition-all ${
                           isSel ? 'border-yellow-400/60 bg-yellow-400/10' : 'border-white/5 bg-black/20 hover:bg-white/5'}`}>
                         <div className="flex items-center gap-1.5">
                           <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: color }} />
                           <span className="text-xs font-bold text-text-main">{name}</span>
-                          {isSel && <span className="ml-auto text-yellow-400 text-[10px]">선택됨</span>}
+                          {isSel && <span className="ml-auto text-yellow-400 text-[10px]">{selectedObjectIndices.length > 1 ? `+${selectedObjectIndices.length}` : '선택됨'}</span>}
                         </div>
                         <div className="text-[10px] text-text-muted mt-0.5 pl-4">
                           {p.reference_point} · {p.bbox_mm[0]}×{p.bbox_mm[1]} (H{p.height_mm})
@@ -626,11 +670,12 @@ const App: React.FC = () => {
                   floorPlanUrl={floorPlanUrl ?? undefined}
                   roomBboxPx={result.room_bbox_px}
                   imageSizePx={result.image_size_px}
-                  selectedIndex={selectedObjectIndex}
+                  selectedIndices={selectedObjectIndices}
                   selectedWallId={selectedWallId}
-                  onObjectClick={idx => { setSelectedObjectIndex(p => p === idx ? null : idx); setSelectedWallId(null); }}
-                  onWallClick={id => { setSelectedWallId(p => p === id ? null : id); setSelectedObjectIndex(null); }}
+                  onObjectClick={(idx, shiftKey) => handleObjectClick(idx, shiftKey)}
+                  onWallClick={id => { setSelectedWallId(p => p === id ? null : id); setSelectedObjectIndices([]); }}
                   onObjectMove={handleObjectMove}
+                  onObjectMoveMulti={handleObjectMoveMulti}
                   onWallMove={handleWallMove}
                   onObjectRotate={handleObjectRotate}
                 />
@@ -640,8 +685,8 @@ const App: React.FC = () => {
                   placedObjects={localPlaced}
                   detectedObjects={result.equipment_detected || []}
                   walls={walls}
-                  selectedIndex={selectedObjectIndex}
-                  onObjectClick={idx => { setSelectedObjectIndex(p => p === idx ? null : idx); setSelectedWallId(null); }}
+                  selectedIndices={selectedObjectIndices}
+                  onObjectClick={(idx, shiftKey) => handleObjectClick(idx, shiftKey)}
                   onObjectRotate={handleObjectRotate}
                 />
               )

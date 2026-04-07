@@ -40,6 +40,12 @@ OBJECT_PRIORITY: dict[str, int] = {
     "shelf_rental": 5,      # 렌탈 선반
 }
 
+# 접근성 체크 면제 오브젝트 — 주변 오브젝트에 둘러싸여도 무방한 타입
+# (관람/포토 목적으로 구석/코너 배치가 자연스러운 오브젝트)
+ACCESSIBILITY_EXEMPT: frozenset[str] = frozenset({
+    "character_bbox",  # 등신대는 동선 외 공간에 배치해도 됨
+})
+
 
 def _build_walkability_graph(
     room_poly: Polygon,
@@ -231,6 +237,7 @@ def try_place_object(
     corridor_graph: nx.Graph | None = None,
     entrance_pos: tuple[float, float] | None = None,
     clearspace_mm: float = MIN_ACCESS_GAP_MM,
+    check_access: bool = True,
 ) -> tuple[Polygon | None, float, float]:
     """
     방 전체를 x-y 그리드 순서로 스캔하여 제약 조건을 만족하는 후보를 수집.
@@ -264,7 +271,7 @@ def try_place_object(
             if any(obj_poly.intersects(p) for p in placed_polys):
                 test_y += GRID_STEP_MM
                 continue
-            if not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
+            if check_access and not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
                 test_y += GRID_STEP_MM
                 continue
 
@@ -281,6 +288,11 @@ def try_place_object(
     candidates.sort(key=lambda c: -c[0])
 
     # 상위 후보에 대해서만 통로 연결성 체크 (비용이 큰 검사)
+    # check_access=False 면 접근성 면제 오브젝트 → 첫 후보 바로 반환
+    if not check_access:
+        best = candidates[0]
+        return best[1], best[2], best[3]
+
     if corridor_graph is not None and entrance_pos is not None:
         for score, obj_poly, bx, by in candidates[:10]:
             if _corridor_ok(corridor_graph, obj_poly, entrance_pos, placed_polys):
@@ -300,41 +312,31 @@ def plan_cluster_layout(
     """
     N개의 product_display 배치 형태를 결정.
     반환: 서브클러스터별 [(rel_x, rel_y, rotation_deg), ...] 리스트의 리스트.
-    최대 2줄 깊이 제한 — 3줄 이상이면 중간 줄 접근 불가.
 
     배치 형태:
     - 1-2개: 1행 단열
-    - 3-4개: 2열 2행 (또는 1행)
-    - 5-6개: 2행 배치 (앞행 ceil(N/2), 뒷행 floor(N/2))
-    - 7개↑: 두 서브클러스터로 분리
+    - 3-6개: 2행 배치 (앞행 ceil(N/2), 뒷행 나머지)
+    - 7개↑: 1행 단열 — try_place_cluster의 wall snap이 벽 따라 일렬 배치.
+             (분산 배치는 _split_pd_intents_into_groups에서 reference_point 기준으로만 처리)
     """
-    if count >= 7:
-        half = count // 2
-        return plan_cluster_layout(half, unit_w, unit_d, gap_mm) + \
-               plan_cluster_layout(count - half, unit_w, unit_d, gap_mm)
-
     if count <= 2:
         # 1행 단열
+        return [[(i * (unit_w + gap_mm), 0.0, 0.0) for i in range(count)]]
+
+    if count <= 6:
+        # 최대 2행 배치
+        cols = math.ceil(count / 2)
+        rows = math.ceil(count / cols)  # 2 이하 보장
         units = []
-        for i in range(count):
-            units.append((i * (unit_w + gap_mm), 0.0, 0.0))
+        for r in range(rows):
+            row_count = cols if (r < rows - 1 or count % cols == 0) else count % cols
+            row_x_offset = ((cols - row_count) * (unit_w + gap_mm)) / 2  # 행 중앙 정렬
+            for c in range(row_count):
+                units.append((row_x_offset + c * (unit_w + gap_mm), r * (unit_d + gap_mm), 0.0))
         return [units]
 
-    # 3-6개: 최대 2행
-    cols = math.ceil(count / 2)
-    rows = math.ceil(count / cols)  # 2 이하 보장
-    units = []
-    idx = 0
-    for r in range(rows):
-        # 뒷행(r=1)은 앞행 기준으로 unit_d + gap 뒤에 배치
-        row_count = cols if (r < rows - 1 or count % cols == 0) else count % cols
-        row_x_offset = ((cols - row_count) * (unit_w + gap_mm)) / 2  # 행 중앙 정렬
-        for c in range(row_count):
-            x = row_x_offset + c * (unit_w + gap_mm)
-            y = r * (unit_d + gap_mm)
-            units.append((x, y, 0.0))
-            idx += 1
-    return [units]
+    # 7개 이상: 단열로 벽 따라 배치 (try_place_cluster wall snap이 처리)
+    return [[(i * (unit_w + gap_mm), 0.0, 0.0) for i in range(count)]]
 
 
 def _cluster_bounding_box(
@@ -443,38 +445,89 @@ def try_place_cluster(
 
         return True
 
-    # ── 전략 1: 벽 인접 (wall_snap) ────────────────────────────
-    # 클러스터의 bounding box 높이(y 방향 폭) 계산
+    # ── 전략 1: 벽 인접 (wall_snap) — 항상 1행 단열로 시도 ─────────────────
+    # 벽에 붙을 때는 반드시 일렬 정렬 → 안쪽 유닛이 갇히는 현상 방지
+    n_units = len(units)
+    single_row_h_units = [(i * (unit_w + gap_mm), 0.0, 0.0) for i in range(n_units)]  # 가로 단열
+    single_row_v_units = [(0.0, i * (unit_d + gap_mm), 0.0) for i in range(n_units)]  # 세로 단열
+
+    def _bbox(us: list[tuple[float, float, float]]) -> tuple[float, float]:
+        """유닛 리스트의 (폭, 높이) 반환"""
+        if not us:
+            return unit_w, unit_d
+        w = max(rx for rx, _, _ in us) - min(rx for rx, _, _ in us) + unit_w
+        h = max(ry for _, ry, _ in us) - min(ry for _, ry, _ in us) + unit_d
+        return w, h
+
+    def _try_wall_snap(wall_units: list[tuple[float, float, float]]) -> tuple | None:
+        """주어진 유닛 배치로 4방향 벽 snap 시도. 성공하면 (built, cx, cy) 반환."""
+        oc_wx, oc_wy = _cluster_center_offset(wall_units)
+        wbbox_w, wbbox_h = _bbox(wall_units)
+
+        def _build_wall_polys(ccx: float, ccy: float):
+            return [
+                (make_object_polygon(ccx + rx - oc_wx, ccy + ry - oc_wy, unit_w, unit_d, rot),
+                 ccx + rx - oc_wx, ccy + ry - oc_wy)
+                for rx, ry, rot in wall_units
+            ]
+
+        def _wall_valid(ccx: float, ccy: float) -> bool:
+            built = _build_wall_polys(ccx, ccy)
+            for poly, _, _ in built:
+                if not room_poly.contains(poly): return False
+                if any(poly.intersects(dz) for dz in dead_zones): return False
+                if any(poly.intersects(pp) for pp in placed_polys): return False
+            all_p = [p for p, _, _ in built]
+            bminx = min(p.bounds[0] for p in all_p)
+            bminy = min(p.bounds[1] for p in all_p)
+            bmaxx = max(p.bounds[2] for p in all_p)
+            bmaxy = max(p.bounds[3] for p in all_p)
+            aisle_f = box(bminx, bminy - clearspace_mm, bmaxx, bminy)
+            aisle_b = box(bminx, bmaxy, bmaxx, bmaxy + clearspace_mm)
+            aisle_l = box(bminx - clearspace_mm, bminy, bminx, bmaxy)
+            aisle_r = box(bmaxx, bminy, bmaxx + clearspace_mm, bmaxy)
+            for aisle in (aisle_f, aisle_b, aisle_l, aisle_r):
+                if room_poly.contains(aisle) \
+                   and not any(aisle.intersects(pp) for pp in placed_polys) \
+                   and not any(aisle.intersects(dz) for dz in dead_zones):
+                    return True
+            return False
+
+        candidates = [
+            (ref_cx, miny_r + wbbox_h / 2 + gap_mm),   # 북벽
+            (ref_cx, maxy_r - wbbox_h / 2 - gap_mm),   # 남벽
+            (minx_r + wbbox_w / 2 + gap_mm, ref_cy),    # 서벽
+            (maxx_r - wbbox_w / 2 - gap_mm, ref_cy),    # 동벽
+        ]
+        for wcx, wcy in candidates:
+            if _wall_valid(wcx, wcy):
+                return _build_wall_polys(wcx, wcy), wcx, wcy
+        return None
+
+    # 가로 단열 먼저, 실패 시 세로 단열 시도
+    for row_units in (single_row_h_units, single_row_v_units):
+        result = _try_wall_snap(row_units)
+        if result is not None:
+            return result[0], result[1], result[2]
+
+    # 단열 실패 시 기존 격자 형태로 벽 snap 재시도
     dummy = _build_polys(ref_cx, ref_cy)
     if dummy:
         all_dummy = [p for p, _, _ in dummy]
-        _, d_miny, _, d_maxy = (
-            min(p.bounds[0] for p in all_dummy),
-            min(p.bounds[1] for p in all_dummy),
-            max(p.bounds[2] for p in all_dummy),
-            max(p.bounds[3] for p in all_dummy),
-        )
-        cluster_h = d_maxy - d_miny  # bounding box 높이
+        cluster_h = max(p.bounds[3] for p in all_dummy) - min(p.bounds[1] for p in all_dummy)
         cluster_w = max(p.bounds[2] for p in all_dummy) - min(p.bounds[0] for p in all_dummy)
     else:
         cluster_h = unit_d
         cluster_w = unit_w
 
-    wall_candidates: list[tuple[float, float]] = [
-        # 북벽 인접: 클러스터 중심 y = miny_r + cluster_h/2
+    for wcx, wcy in [
         (ref_cx, miny_r + cluster_h / 2 + gap_mm),
-        # 남벽 인접
         (ref_cx, maxy_r - cluster_h / 2 - gap_mm),
-        # 서벽 인접
         (minx_r + cluster_w / 2 + gap_mm, ref_cy),
-        # 동벽 인접
         (maxx_r - cluster_w / 2 - gap_mm, ref_cy),
-    ]
-
-    for wcx, wcy in wall_candidates:
+    ]:
         if _is_valid(wcx, wcy):
-            built = _build_polys(wcx, wcy)
-            return built, wcx, wcy
+            return _build_polys(wcx, wcy), wcx, wcy
 
     # ── 전략 2: 기준점 주변 그리드 스캔 ────────────────────────
     step = GRID_STEP_MM
@@ -509,26 +562,14 @@ def _split_pd_intents_into_groups(
     """
     product_display PlacementIntent 목록을 클러스터 그룹으로 분리.
     - LLM이 서로 다른 reference_point를 지정했으면 그 기준으로 분리
-    - 모두 같은 reference_point이고 N≥7이면 절반씩 강제 분리
+    - 같은 reference_point끼리는 하나의 클러스터로 유지 (강제 분리 없음)
+      → 다수 배치 요구 시 벽 한 면에 연속 배치 가능
     """
     from collections import defaultdict
     groups_by_ref: dict[str, list] = defaultdict(list)
     for intent in pd_intents:
         groups_by_ref[intent.reference_point].append(intent)
-
-    groups = list(groups_by_ref.values())
-
-    # 단일 그룹에 7개 이상이면 절반씩 재분리
-    final_groups = []
-    for group in groups:
-        if len(group) >= 7:
-            half = len(group) // 2
-            final_groups.append(group[:half])
-            final_groups.append(group[half:])
-        else:
-            final_groups.append(group)
-
-    return final_groups
+    return list(groups_by_ref.values())
 
 
 def compute_layout(
@@ -684,6 +725,7 @@ def compute_layout(
             room_poly, dead_zones, placed_polys,
             corridor_graph=corridor_graph,
             entrance_pos=entrance_pos,
+            check_access=(intent.object_type not in ACCESSIBILITY_EXEMPT),
         )
 
         if obj_poly is None:

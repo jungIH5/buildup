@@ -26,8 +26,12 @@ SYSTEM_PROMPT = """당신은 공간 배치 전문가입니다.
 1. 좌표(x, y), mm 숫자 값, 픽셀 값을 출력하지 마세요.
 2. reference_point 이름(예: entrance, north_wall_mid)으로만 위치를 지시하세요.
 3. 반드시 JSON 형식으로만 응답하세요.
-4. 오브젝트를 공간 전체에 고르게 분산하세요 — 동일 reference_point에 최대 2개까지만 배치.
-5. entrance_zone / mid_zone / deep_zone을 균형 있게 활용해 한쪽으로 몰리지 않게 하세요.
+
+위치 결정 원칙:
+4. 사용자가 위치를 지정한 오브젝트 → 그 위치와 가장 일치하는 reference_point를 선택하세요.
+   분산 규칙 면제 — 여러 개가 같은 reference_point에 몰려도 됩니다.
+5. 사용자가 위치를 지정하지 않은 오브젝트 → entrance_zone·mid_zone·deep_zone을 균형 있게 사용하세요.
+   동일 reference_point에 같은 타입 최대 2개.
 
 product_display(상품진열대) 클러스터 규칙:
 6. product_display 1-6개: 동일한 reference_point 1개에 묶어서 배치하세요.
@@ -54,9 +58,9 @@ PLACEMENT_PROMPT_TEMPLATE = """다음 정보를 바탕으로 오브젝트 배치
 
 {relationships_section}
 
-분산 배치 원칙 (필수 준수):
-- 같은 reference_point에 최대 2개까지만 배치
-- entrance_zone·mid_zone·deep_zone을 균형 있게 사용
+배치 원칙:
+- 사용자 요구사항에서 위치가 명시된 오브젝트: 해당 위치의 reference_point 우선 선택 (분산 규칙 적용 안 함)
+- 위치가 명시되지 않은 오브젝트: entrance_zone·mid_zone·deep_zone 균형 있게 분산, 동일 reference_point에 같은 타입 최대 2개
 - 동선이 확보되도록 오브젝트 간 여백 고려
 
 {feedback_section}
@@ -105,6 +109,90 @@ RELATIONSHIPS_TEMPLATE = """
 브랜드 캐릭터/오브젝트 간 관계 제약 (반드시 준수):
 {relationships}
 """
+
+# 오브젝트 타입 → 한국어 별칭 매핑 (AI 파서 프롬프트에 사용)
+_OBJECT_ALIASES = {
+    "character_bbox":  "캐릭터 조형물, 캐릭터 등신대, 등신대, 캐릭터 인형, 캐릭터 피규어, 캐릭터 모형, 캐릭터",
+    "photo_zone":      "포토존, 포토 존, 사진존",
+    "banner_stand":    "배너 스탠드, 배너스탠드, 배너, 현수막 스탠드",
+    "product_display": "상품 진열대, 진열대, 상품진열대, 디스플레이",
+    "shelf_rental":    "렌탈 선반, 렌탈선반, 선반",
+}
+
+_QTY_PARSE_SYSTEM = (
+    "당신은 공간 배치 요구사항 파서입니다. "
+    "사용자 텍스트에서 각 오브젝트의 배치 수량을 추출하세요. "
+    "수량이 '최대한', '가득', '전부', '모두', '가능한 만큼', '채워달라', '빼곡히' 등으로 표현된 경우 "
+    "해당 오브젝트의 수량을 -1로 반환하세요 (벽 용량 자동 계산 신호). "
+    "반드시 JSON만 반환하세요. 설명 텍스트 없이 JSON 오브젝트만."
+)
+
+# 벽 용량 자동 계산 신호 값
+_FILL_SIGNAL = -1
+
+
+def _compute_wall_capacity(
+    room_polygon_mm: list,
+    obj_w: float,
+    gap_mm: float = 50.0,
+    clearspace_mm: float = 600.0,
+) -> int:
+    """
+    가장 긴 벽 한 면에 단열로 배치 가능한 최대 개수.
+    - 브랜드 clearspace를 오브젝트 간격이 아닌 끝단 여유로 적용
+    - 실제 배치 시 dead_zone·통로 체크에서 추가 제한될 수 있음
+    """
+    xs = [p[0] for p in room_polygon_mm]
+    ys = [p[1] for p in room_polygon_mm]
+    longest = max(max(xs) - min(xs), max(ys) - min(ys))
+    # 양쪽 끝 여유 = clearspace_mm, 오브젝트 사이 간격 = gap_mm
+    effective = longest - clearspace_mm * 2
+    return max(1, int(effective / (obj_w + gap_mm)))
+
+
+async def _parse_qty_with_ai(
+    user_requirements: str,
+    client: anthropic.AsyncAnthropic,
+) -> dict[str, int]:
+    """
+    Claude Haiku로 자연어 요구사항에서 오브젝트별 수량을 추출.
+    반환: {"character_bbox": 3, "product_display": 4, ...}
+    "최대한/가득" 등 fill 표현은 {"product_display": -1} 형태로 반환 (벽 용량 자동 계산).
+    인식 못 한 타입은 포함하지 않음.
+    """
+    aliases_desc = "\n".join(
+        f'- "{k}": {v}로 표현될 수 있음' for k, v in _OBJECT_ALIASES.items()
+    )
+    prompt = (
+        f"다음 요구사항 텍스트에서 각 오브젝트 타입별 배치 수량을 추출하세요.\n\n"
+        f"오브젝트 타입과 한국어 표현:\n{aliases_desc}\n\n"
+        f"수량 추출 규칙:\n"
+        f"- 명시적 숫자: 해당 숫자 그대로\n"
+        f"- '최대한', '가득', '전부', '채워달라', '모두', '빼곡히' 등: -1\n\n"
+        f"요구사항:\n{user_requirements}\n\n"
+        f"결과를 JSON으로만 반환하세요. 예시: {{\"character_bbox\": 3, \"product_display\": -1}}\n"
+        f"언급되지 않은 타입은 포함하지 마세요."
+    )
+    try:
+        resp = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            system=_QTY_PARSE_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        if "```" in text:
+            import re as _re
+            m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+            text = m.group(1) if m else text
+        result = json.loads(text)
+        # 알려진 타입만 필터링. -1(fill signal)과 양수 모두 허용
+        return {
+            k: int(v) for k, v in result.items()
+            if k in _OBJECT_ALIASES and int(v) != 0
+        }
+    except Exception:
+        return {}
 
 
 async def run_agent3(
@@ -156,9 +244,7 @@ async def run_agent3(
     all_violations: list = []
 
     # ── 사용자 요구사항 파싱 ──
-    # 기본 eligible_objects는 항상 유지. 요구사항은 수량만 조정.
-    # 예: "상품진열대 8개" → product_display 기본 1개를 8개로 늘림 (다른 오브젝트 유지)
-    import re
+    # Claude Haiku로 자연어에서 수량을 추출. 정규식 패턴 의존 없이 맥락 기반 인식.
     user_requirements_section = ""
 
     # 기본 수량: eligible_objects의 각 타입은 기본 1개
@@ -171,27 +257,27 @@ async def run_agent3(
         user_requirements_section = USER_REQUIREMENTS_TEMPLATE.format(
             requirements=user_requirements.strip()
         )
-        qty_patterns = [
-            (r'product_display[를을]?\s*(\d+)개', 'product_display'),
-            (r'상품\s*진열대[를을]?\s*(\d+)개', 'product_display'),
-            (r'character_bbox[를을]?\s*(\d+)개', 'character_bbox'),
-            (r'캐릭터\s*조형물?[를을]?\s*(\d+)개', 'character_bbox'),
-            (r'photo_zone[를을]?\s*(\d+)개', 'photo_zone'),
-            (r'포토\s*존?[를을]?\s*(\d+)개', 'photo_zone'),
-            (r'banner_stand[를을]?\s*(\d+)개', 'banner_stand'),
-            (r'배너\s*스탠드?[를을]?\s*(\d+)개', 'banner_stand'),
-            (r'shelf_rental[를을]?\s*(\d+)개', 'shelf_rental'),
-            (r'렌탈?\s*선반[를을]?\s*(\d+)개', 'shelf_rental'),
-        ]
-        for pattern, obj_type in qty_patterns:
-            m = re.search(pattern, user_requirements, re.IGNORECASE)
-            if m:
-                qty_overrides[obj_type] = int(m.group(1))
+        # AI 파서로 자연어 수량 추출 (등신대, 피규어 등 다양한 표현 처리)
+        qty_overrides = await _parse_qty_with_ai(user_requirements.strip(), client)
+
+        # fill 신호(-1) 처리: 벽 용량 자동 계산
+        for obj_type, qty in list(qty_overrides.items()):
+            if qty == _FILL_SIGNAL and obj_type in furniture_sizes:
+                obj_w = furniture_sizes[obj_type][0]
+                gap_mm = 50.0
+                max_qty = _compute_wall_capacity(
+                    floor.room_polygon_mm,
+                    obj_w,
+                    gap_mm=gap_mm,
+                    clearspace_mm=max(standards.clearspace_mm, 600.0),
+                )
+                qty_overrides[obj_type] = max_qty
 
     # 최종 수량 결정: 요구사항 수량이 기본보다 크면 그 값으로, 아니면 기본값 유지
     final_counts = dict(base_counts)
     for obj_type, qty in qty_overrides.items():
-        final_counts[obj_type] = max(final_counts.get(obj_type, 0), qty)
+        if qty > 0:
+            final_counts[obj_type] = max(final_counts.get(obj_type, 0), qty)
 
     # 기존 배치 수량 차감 — 이미 배치된 만큼은 신규 배치 불필요
     new_counts: dict[str, int] = {}
