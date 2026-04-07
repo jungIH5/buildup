@@ -17,6 +17,8 @@ interface DetectedObject {
   size_mm?: [number, number];
 }
 
+interface UserMarking { equipment_type: string; position_mm: [number, number]; }
+
 interface FloorView2DProps {
   roomPolygon: [number, number][];
   placedObjects: PlacedObject[];
@@ -25,6 +27,9 @@ interface FloorView2DProps {
   selectedIndices?: number[];
   onObjectClick?: (index: number | null, shiftKey?: boolean) => void;
   onObjectRotate?: (index: number, deltaDeg: number) => void;
+  userMarkings?: UserMarking[];
+  markingMode?: boolean;
+  onMapClick?: (x: number, y: number) => void;
 }
 
 const OBJECT_COLORS: Record<string, string> = {
@@ -50,6 +55,7 @@ const SVG_H   = 600;
 const FloorView2D: React.FC<FloorView2DProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
   selectedIndices = [], onObjectClick, onObjectRotate,
+  userMarkings = [], markingMode = false, onMapClick,
 }) => {
   const { scale, minX, minY, toSVG } = useMemo(() => {
     if (roomPolygon.length === 0) {
@@ -77,8 +83,19 @@ const FloorView2D: React.FC<FloorView2DProps> = ({
         viewBox={`0 0 ${SVG_W} ${SVG_H}`}
         width="100%"
         height="100%"
-        style={{ maxHeight: '100%', userSelect: 'none' }}
-        onClick={() => onObjectClick?.(null)}
+        style={{ maxHeight: '100%', userSelect: 'none', cursor: markingMode ? 'crosshair' : 'default' }}
+        onClick={(e) => {
+          if (markingMode && onMapClick) {
+            const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+            const svgX = ((e.clientX - rect.left) / rect.width)  * SVG_W;
+            const svgY = ((e.clientY - rect.top)  / rect.height) * SVG_H;
+            const mmX = (svgX - PADDING) / scale + (roomPolygon.length ? Math.min(...roomPolygon.map(p => p[0])) : 0);
+            const mmY = (svgY - PADDING) / scale + (roomPolygon.length ? Math.min(...roomPolygon.map(p => p[1])) : 0);
+            onMapClick(mmX, mmY);
+          } else {
+            onObjectClick?.(null);
+          }
+        }}
       >
         {/* 배경 격자 */}
         <defs>
@@ -262,6 +279,20 @@ const FloorView2D: React.FC<FloorView2DProps> = ({
           <rect x="7" y="26" width="14" height="10" fill="#22c55e" fillOpacity={0.7} rx="1" />
           <text x="26" y="34" fontSize="9" fill="#cbd5e1">비상구</text>
         </g>
+
+        {/* 사용자 수동 마킹 */}
+        {userMarkings.map((m, i) => {
+          const [cx, cy] = toSVG(m.position_mm[0], m.position_mm[1]);
+          const color = m.equipment_type === 'exit' ? '#22c55e' : m.equipment_type === 'sprinkler' ? '#ef4444' : '#f59e0b';
+          return (
+            <g key={`marking-${i}`}>
+              <circle cx={cx} cy={cy} r={8} fill={color} fillOpacity={0.7} stroke="#ffffff" strokeWidth="1.5" strokeDasharray="3 2" />
+              <text x={cx} y={cy - 12} textAnchor="middle" fontSize="8" fill={color} fontWeight="bold">
+                {m.equipment_type === 'exit' ? 'EXIT' : m.equipment_type === 'sprinkler' ? 'SPR' : 'SH'}
+              </text>
+            </g>
+          );
+        })}
 
         {/* 스케일 바 (500mm) */}
         <g transform={`translate(${PADDING}, ${SVG_H - 20})`}>

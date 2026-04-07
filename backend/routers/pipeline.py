@@ -14,6 +14,7 @@ from agents.agent1_brand import run_agent1
 from agents.agent2_floor import run_agent2
 from agents.agent3_layout import run_agent3
 from core.schemas import LayoutResult, FloorAnalysis, BrandStandards
+from core.intent_parser import parse_intents
 
 router = APIRouter()
 
@@ -158,6 +159,15 @@ async def run_pipeline(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Agent 2 실패: {e}")
 
+    # Intent Parser — Agent 2 공간 정보 기반으로 자연어 요구사항 구조화
+    resolved_intents = None
+    if user_requirements and user_requirements.strip():
+        try:
+            resolved_intents = await parse_intents(user_requirements, floor, client)
+        except Exception as e:
+            import logging
+            logging.warning(f"[Pipeline] Intent Parser 실패 (폴백 사용): {e}")
+
     # Agent 3
     try:
         # 비상구 좌표 추출 (check_emergency_path 활성화)
@@ -176,6 +186,7 @@ async def run_pipeline(
             emergency_exits=emergency_exits if emergency_exits else None,
             relationships=standards.relationships if standards.relationships else None,
             user_requirements=user_requirements,
+            resolved_intents=resolved_intents,
         )
     except Exception as e:
         import traceback
@@ -242,6 +253,14 @@ async def layout_only(request: Request, body: LayoutOnlyRequest):
         if body.emergency_exits else None
     )
 
+    resolved_intents = None
+    if body.user_requirements and body.user_requirements.strip():
+        try:
+            resolved_intents = await parse_intents(body.user_requirements, floor, client)
+        except Exception as e:
+            import logging
+            logging.warning(f"[Pipeline/layout_only] Intent Parser 실패 (폴백 사용): {e}")
+
     try:
         result: LayoutResult = await run_agent3(
             floor=floor,
@@ -253,6 +272,7 @@ async def layout_only(request: Request, body: LayoutOnlyRequest):
             relationships=standards.relationships if standards.relationships else None,
             user_requirements=body.user_requirements,
             existing_placed=body.existing_placed or None,
+            resolved_intents=resolved_intents,
         )
     except Exception as e:
         import traceback; traceback.print_exc()

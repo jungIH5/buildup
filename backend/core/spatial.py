@@ -150,7 +150,6 @@ def _score_position(
 
 def build_dead_zones(
     floor: FloorAnalysis,
-    standards: BrandStandards,
 ) -> list[Polygon]:
     """
     Dead Zone 폴리곤 목록 생성:
@@ -493,15 +492,39 @@ def try_place_cluster(
                     return True
             return False
 
-        candidates = [
-            (ref_cx, miny_r + wbbox_h / 2 + gap_mm),   # 북벽
-            (ref_cx, maxy_r - wbbox_h / 2 - gap_mm),   # 남벽
-            (minx_r + wbbox_w / 2 + gap_mm, ref_cy),    # 서벽
-            (maxx_r - wbbox_w / 2 - gap_mm, ref_cy),    # 동벽
+        # 4방향 벽별 후보 (중앙 우선, 실패 시 양 끝)
+        wall_candidates: list[tuple[float, tuple, tuple, tuple]] = [
+            # (ref_point까지 거리, 중앙, 왼쪽/위, 오른쪽/아래)
+            (
+                abs(ref_cy - miny_r),  # 북벽 거리
+                (ref_cx,                         miny_r + wbbox_h / 2 + gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+            ),
+            (
+                abs(ref_cy - maxy_r),  # 남벽 거리
+                (ref_cx,                         maxy_r - wbbox_h / 2 - gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
+            (
+                abs(ref_cx - minx_r),  # 서벽 거리
+                (minx_r + wbbox_w / 2 + gap_mm, ref_cy),
+                (minx_r + wbbox_w / 2 + gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
+            (
+                abs(ref_cx - maxx_r),  # 동벽 거리
+                (maxx_r - wbbox_w / 2 - gap_mm, ref_cy),
+                (maxx_r - wbbox_w / 2 - gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
         ]
-        for wcx, wcy in candidates:
-            if _wall_valid(wcx, wcy):
-                return _build_wall_polys(wcx, wcy), wcx, wcy
+        # ref_point에 가까운 벽부터 시도
+        for _, center, left, right in sorted(wall_candidates, key=lambda t: t[0]):
+            for pos in (center, left, right):
+                if _wall_valid(*pos):
+                    return _build_wall_polys(*pos), pos[0], pos[1]
         return None
 
     # 가로 단열 먼저, 실패 시 세로 단열 시도
@@ -589,7 +612,7 @@ def compute_layout(
     - blocking violation 있으면 glb_blocked = True
     """
     room_poly = Polygon(floor.room_polygon_mm)
-    dead_zones = build_dead_zones(floor, standards)
+    dead_zones = build_dead_zones(floor)
 
     placed_objects: list[PlacedObject] = []
     placed_polys: list[Polygon] = list(initial_placed_polys) if initial_placed_polys else []

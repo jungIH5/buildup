@@ -4,6 +4,7 @@ import {
   Upload, Layout, AlertCircle, ArrowRight, Settings,
   Package, Layers, Box, RotateCcw, Trash2, PlusSquare,
   Undo2, RefreshCw, Send, ChevronDown, ChevronUp, RotateCw,
+  Download, MapPin, Eye,
 } from 'lucide-react';
 import './globals.css';
 
@@ -26,6 +27,18 @@ interface Violation    { severity: string; object_type: string; rule: string; de
 interface DetectedEquip { equipment_type: string; position_mm: [number, number]; size_mm?: [number, number]; }
 interface BrandStandards { clearspace_mm: number; main_corridor_min_mm: number; source: string; [key: string]: unknown; }
 interface Summary { total_placed: number; total_failed: number; [key: string]: unknown; }
+
+interface ReferencePoint { name: string; position_mm: [number, number]; zone_label?: string; }
+interface Agent2Preview {
+  room_polygon_mm: [number, number][];
+  dead_zones_mm: [number, number][][];
+  reference_points: ReferencePoint[];
+  eligible_objects: string[];
+  scale_mm_per_px: number;
+  scale_confidence: string;
+  equipment_detected: DetectedEquip[];
+}
+interface UserMarking { equipment_type: string; position_mm: [number, number]; }
 
 interface PipelineResult {
   placed: Placement[];
@@ -93,6 +106,14 @@ const App: React.FC = () => {
   const [selectedWallId, setSelectedWallId]         = useState<string | null>(null);
   const [viewMode, setViewMode]                     = useState<'3d' | '2d'>('3d');
 
+  // Agent 2 미리보기
+  const [agent2Preview, setAgent2Preview]           = useState<Agent2Preview | null>(null);
+  const [isPreviewing, setIsPreviewing]             = useState(false);
+
+  // 수동 마킹
+  const [userMarkings, setUserMarkings]             = useState<UserMarking[]>([]);
+  const [markingType, setMarkingType]               = useState<string>('sprinkler');
+
   // ── Undo ──
   type Snapshot = { placed: Placement[]; walls: Wall[] };
   const undoStack = useRef<Snapshot[]>([]);
@@ -134,6 +155,7 @@ const App: React.FC = () => {
     if (brandManual) formData.append('brand_manual', brandManual);
     if (floorPlan)   formData.append('floor_plan', floorPlan);
     if (allReqs)     formData.append('user_requirements', allReqs);
+    if (userMarkings.length > 0) formData.append('user_markings', JSON.stringify(userMarkings));
     try {
       const res = await axios.post('http://localhost:8000/api/pipeline/run', formData);
       setResult(res.data);
@@ -146,7 +168,7 @@ const App: React.FC = () => {
       setUploadOpen(false);
     } catch (err) {
       console.error(err);
-      alert('분석 중 오류가 발생했습니다. 백엔드 서버를 확인하세요.');
+      alert(`분석 실패: ${getErrorMessage(err)}`);
     } finally {
       setIsProcessing(false);
     }
@@ -179,7 +201,7 @@ const App: React.FC = () => {
       undoStack.current = [];
     } catch (err) {
       console.error(err);
-      alert('재생성 중 오류가 발생했습니다.');
+      alert(`재생성 실패: ${getErrorMessage(err)}`);
     } finally {
       setIsProcessing(false);
     }
@@ -262,6 +284,56 @@ const App: React.FC = () => {
       }];
     });
     setSelectedWallId(id);
+  };
+
+  // ── 에러 메시지 추출 ──
+  const getErrorMessage = (err: unknown): string => {
+    if (axios.isAxiosError(err) && err.response?.data?.detail) {
+      return String(err.response.data.detail);
+    }
+    if (err instanceof Error) return err.message;
+    return '알 수 없는 오류가 발생했습니다.';
+  };
+
+  // ── Agent 2 도면 미리보기 ──
+  const handlePreview = async () => {
+    if (!floorPlan) return;
+    setIsPreviewing(true);
+    const formData = new FormData();
+    formData.append('floor_plan', floorPlan);
+    if (userMarkings.length > 0)
+      formData.append('user_markings', JSON.stringify(userMarkings));
+    try {
+      const res = await axios.post('http://localhost:8000/api/pipeline/agent2/review', formData);
+      setAgent2Preview(res.data);
+    } catch (err) {
+      alert(`도면 분석 실패: ${getErrorMessage(err)}`);
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  // ── GLB 내보내기 ──
+  const handleExportGlb = async () => {
+    if (!result) return;
+    try {
+      const res = await axios.post(
+        'http://localhost:8000/api/export/glb',
+        {
+          room_polygon_mm: result.room_polygon_mm ?? [],
+          placed_objects: localPlaced,
+          walls,
+        },
+        { responseType: 'blob' }
+      );
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'buildup_layout.glb';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(`GLB 내보내기 실패: ${getErrorMessage(err)}`);
+    }
   };
 
   const canAnalyze = (!!floorPlan || !!brandManual) && !isProcessing;
@@ -373,6 +445,23 @@ const App: React.FC = () => {
                   />
                 </div>
 
+                {/* 도면 미리보기 버튼 */}
+                {!result && floorPlan && (
+                  <button
+                    onClick={handlePreview}
+                    disabled={isPreviewing || isProcessing}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl
+                               border border-accent/40 text-accent text-xs font-bold
+                               hover:bg-accent/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isPreviewing ? (
+                      <><RefreshCw size={12} className="animate-spin" /> 도면 분석 중...</>
+                    ) : (
+                      <><Eye size={12} /> 도면 Dead Zone 미리보기</>
+                    )}
+                  </button>
+                )}
+
                 {/* 분석 시작 버튼 (결과 없을 때) */}
                 {!result && (
                   <button
@@ -461,6 +550,38 @@ const App: React.FC = () => {
           {/* 분석 완료 후 패널들 */}
           {result && (
             <>
+              {/* 수동 설비 마킹 */}
+              <div className="px-4 py-3 border-b border-border">
+                <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5">
+                  <MapPin size={13} className="text-accent" /> 설비 마킹
+                  <span className="ml-auto text-[10px] text-text-muted">2D 뷰 클릭</span>
+                </h4>
+                <div className="flex gap-1.5 mb-2">
+                  {(['sprinkler', 'exit', 'shelf'] as const).map(t => (
+                    <button key={t}
+                      onClick={() => setMarkingType(t)}
+                      className={`flex-1 py-1 rounded-lg border text-[10px] font-bold transition-colors ${
+                        markingType === t
+                          ? 'border-accent bg-accent/20 text-accent'
+                          : 'border-border text-text-muted hover:bg-white/5'
+                      }`}>
+                      {t === 'sprinkler' ? '스프링클러' : t === 'exit' ? '비상구' : '선반'}
+                    </button>
+                  ))}
+                </div>
+                {userMarkings.length > 0 && (
+                  <div className="space-y-1">
+                    {userMarkings.map((m, i) => (
+                      <div key={i} className="flex items-center justify-between px-2 py-1 rounded bg-black/20 text-[10px] text-text-muted">
+                        <span>{m.equipment_type} ({Math.round(m.position_mm[0])}, {Math.round(m.position_mm[1])})</span>
+                        <button onClick={() => setUserMarkings(prev => prev.filter((_, j) => j !== i))}
+                          className="text-red-400 hover:text-red-300 ml-1">×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               {/* 가벽 설치 */}
               <div className="px-4 py-3 border-b border-border">
                 <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5">
@@ -643,6 +764,12 @@ const App: React.FC = () => {
                                hover:text-white hover:bg-white/10 transition-colors">
                     <Undo2 size={12} /> 되돌리기
                   </button>
+                  <button onClick={handleExportGlb}
+                    title="GLB 3D 파일 내보내기"
+                    className="flex items-center gap-1 px-2 py-1 rounded-lg border border-accent/40 text-[11px] font-bold text-accent
+                               hover:bg-accent/10 transition-colors">
+                    <Download size={12} /> GLB 내보내기
+                  </button>
                 </>
               )}
               <div className="flex rounded-lg border border-border overflow-hidden text-[11px] font-bold">
@@ -660,6 +787,24 @@ const App: React.FC = () => {
 
           {/* Viewer canvas */}
           <div className="flex-1 bg-[#0a0f1d] relative overflow-hidden">
+            {/* Agent 2 미리보기 오버레이 */}
+            {agent2Preview && !result && (
+              <div className="absolute inset-0 z-10">
+                <FloorView2D
+                  roomPolygon={agent2Preview.room_polygon_mm}
+                  placedObjects={[]}
+                  detectedObjects={agent2Preview.equipment_detected}
+                  userMarkings={userMarkings}
+                  markingMode={true}
+                  onMapClick={(x, y) => setUserMarkings(prev => [...prev, { equipment_type: markingType, position_mm: [x, y] }])}
+                />
+                <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-black/70 backdrop-blur-sm
+                                text-xs text-accent px-3 py-1.5 rounded-full border border-accent/30 pointer-events-none">
+                  도면 분석 완료 · 클릭으로 설비 마킹 · 좌측 "분석 시작" 버튼으로 배치 진행
+                </div>
+              </div>
+            )}
+
             {result ? (
               viewMode === '3d' ? (
                 <ThreeViewer
@@ -688,6 +833,9 @@ const App: React.FC = () => {
                   selectedIndices={selectedObjectIndices}
                   onObjectClick={(idx, shiftKey) => handleObjectClick(idx, shiftKey)}
                   onObjectRotate={handleObjectRotate}
+                  userMarkings={userMarkings}
+                  markingMode={viewMode === '2d'}
+                  onMapClick={(x, y) => setUserMarkings(prev => [...prev, { equipment_type: markingType, position_mm: [x, y] }])}
                 />
               )
             ) : (

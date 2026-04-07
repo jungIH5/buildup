@@ -9,7 +9,7 @@ import anthropic
 import os
 from dotenv import load_dotenv
 
-from routers import upload, pipeline, export
+from routers import pipeline, export
 
 load_dotenv()
 
@@ -38,7 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(upload.router, prefix="/api/upload", tags=["Upload"])
 app.include_router(pipeline.router, prefix="/api/pipeline", tags=["Pipeline"])
 app.include_router(export.router, prefix="/api/export", tags=["Export"])
 
