@@ -68,11 +68,29 @@ class ReferencePoint(BaseModel):
     walk_distance_mm: Optional[float] = None  # 입구에서 보행 거리 (mm)
 
 
+class ZoneDefinition(BaseModel):
+    """
+    공간 내 구역 정의.
+    Agent 3 배치 제약의 기본 단위.
+
+    allowed_objects:
+      - None  → 제한 없음 (모든 오브젝트 배치 가능)
+      - []    → 배치 불가 (dead zone)
+      - [..] → 화이트리스트 (해당 타입만 배치 가능)
+    """
+    name: str                                        # 예: "photo_zone_A", "entrance_zone"
+    polygon_mm: list[tuple[float, float]]            # 구역 폴리곤 (mm)
+    label: str                                       # entrance_zone | mid_zone | deep_zone | photo_zone | custom
+    allowed_objects: Optional[list[str]] = None      # None=무제한, []=데드존, [..]=화이트리스트
+    source: Literal["auto", "user_defined", "partition_wall"] = "auto"
+
+
 class FloorAnalysis(BaseModel):
     """Agent 2 전체 출력"""
     room_polygon_mm: list[tuple[float, float]]  # 방 외곽선 (mm)
     dead_zones_mm: list[list[tuple[float, float]]]  # Dead Zone 폴리곤 목록
     reference_points: list[ReferencePoint]
+    zones: list[ZoneDefinition] = Field(default_factory=list)  # 구역 정의 목록
     eligible_objects: list[str]         # 배치 가능 오브젝트 코드명 목록
     scale_mm_per_px: float
     scale_confidence: ConfidenceLevel
