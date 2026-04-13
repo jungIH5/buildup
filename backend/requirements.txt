@@ -12,5 +12,7 @@ pdfplumber==0.11.4
 supabase==2.7.2
 python-dotenv==1.0.1
 trimesh==4.4.9        # .glb 생성용
+mapbox-earcut==2.0.0  # trimesh 폴리곤 삼각화 엔진
 numpy==1.26.4
 pymupdf==1.24.10
+ezdxf==1.3.4           # DXF/DWG 파싱 및 생성

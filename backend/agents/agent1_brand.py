@@ -29,6 +29,13 @@ EXTRACTION_PROMPT = """다음 브랜드 메뉴얼 PDF를 분석하여 아래 JSO
   "main_corridor_min_mm": <숫자 또는 null>,
   "emergency_path_min_mm": <숫자 또는 null>,
   "wall_clearance_mm": <숫자 또는 null>,
+  "furniture_heights_mm": {
+    "character_bbox": <캐릭터 조형물 높이(mm) 또는 null>,
+    "shelf_rental": <렌탈 선반 높이(mm) 또는 null>,
+    "photo_zone": <포토존 배경판 높이(mm) 또는 null>,
+    "banner_stand": <배너 스탠드 높이(mm) 또는 null>,
+    "product_display": <상품 진열대 높이(mm) 또는 null>
+  },
   "confidence": "high" | "medium" | "low",
   "source": "메뉴얼 추출"
 }
@@ -38,37 +45,74 @@ EXTRACTION_PROMPT = """다음 브랜드 메뉴얼 PDF를 분석하여 아래 JSO
 - 추측 금지 — 명확히 기재된 값만 추출
 - 단위가 cm/m면 mm로 변환
 - "넉넉하게", "적당히" 같은 표현은 null
+- furniture_heights_mm: 메뉴얼에 조형물·전시물·구조물의 높이(H) 수치가 명시된 경우에만 기재. null이면 시스템 기본값 사용
 - confidence: 명확한 수치 → high, 서술형 → medium, 불명확 → low
 """
+
+
+_PDF_SIZE_LIMIT = 4 * 1024 * 1024   # 4 MB 초과 시 텍스트 추출로 전환
+_TEXT_CHAR_LIMIT = 60_000            # 추출 텍스트 최대 글자 수
+
+
+def _extract_text_from_pdf(pdf_bytes: bytes, max_chars: int = _TEXT_CHAR_LIMIT) -> str:
+    """PyMuPDF로 PDF 텍스트 추출 (대용량 PDF 폴백)"""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        parts: list[str] = []
+        for page in doc:
+            parts.append(page.get_text())
+            if sum(len(p) for p in parts) >= max_chars:
+                break
+        doc.close()
+        text = "\n".join(parts)
+        return text[:max_chars]
+    except Exception:
+        return ""
 
 
 async def run_agent1(pdf_bytes: bytes, client: anthropic.AsyncAnthropic) -> BrandStandards:
     """
     브랜드 메뉴얼 PDF → BrandStandards
-    실패 또는 null 값은 DEFAULTS로 merge
+    - 4MB 이하: PDF document API로 직접 전송
+    - 4MB 초과: fitz로 텍스트 추출 후 텍스트 메시지로 전송
+    - 실패 또는 null 값은 DEFAULTS로 merge
     """
     import base64
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        system=SYSTEM_PROMPT,
-        messages=[
+    # ── PDF 크기에 따라 전송 방식 결정 ──────────────────
+    if len(pdf_bytes) <= _PDF_SIZE_LIMIT:
+        # 소용량: PDF 그대로 전송
+        user_content = [
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": base64.standard_b64encode(pdf_bytes).decode("utf-8"),
-                        },
-                    },
-                    {"type": "text", "text": EXTRACTION_PROMPT},
-                ],
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(pdf_bytes).decode("utf-8"),
+                },
+            },
+            {"type": "text", "text": EXTRACTION_PROMPT},
+        ]
+    else:
+        # 대용량: 텍스트 추출 후 전송
+        import logging
+        logging.info(f"[Agent1] PDF 크기 {len(pdf_bytes)/1024/1024:.1f}MB > 4MB — 텍스트 추출 모드")
+        extracted = _extract_text_from_pdf(pdf_bytes)
+        if not extracted.strip():
+            return BrandStandards(**DEFAULTS, source="기본값", confidence=ConfidenceLevel.LOW)
+        user_content = [
+            {
+                "type": "text",
+                "text": f"{EXTRACTION_PROMPT}\n\n--- 브랜드 메뉴얼 텍스트 ---\n{extracted}",
             }
-        ],
+        ]
+
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=800,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
     )
 
     raw_text = response.content[0].text.strip()
@@ -91,6 +135,12 @@ async def run_agent1(pdf_bytes: bytes, client: anthropic.AsyncAnthropic) -> Bran
     for key, val in data.items():
         if val is not None:
             merged[key] = val
+
+    # furniture_heights_mm: dict 내부의 null 값 키 제거
+    if "furniture_heights_mm" in merged and isinstance(merged["furniture_heights_mm"], dict):
+        merged["furniture_heights_mm"] = {
+            k: v for k, v in merged["furniture_heights_mm"].items() if v is not None
+        }
 
     merged.setdefault("source", "메뉴얼 추출")
     merged.setdefault("confidence", "medium")

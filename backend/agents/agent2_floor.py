@@ -4,20 +4,233 @@ agent2_floor.py — Agent 2: 도면 분석 + Dead Zone 생성
 2단계 구조:
   전반부: OpenCV polygon + OCR 축척 + Claude Vision 설비 감지
   후반부: px→mm + Shapely Dead Zone + NetworkX reference_point 계산
+
+지원 입력 포맷:
+  - PDF (CAD 벡터 추출 → Vision 폴백)
+  - 이미지 (PNG/JPG/WebP) → Vision + OpenCV
+  - DXF / DWG → ezdxf 직접 파싱 (가장 정밀)
 """
 
 from __future__ import annotations
 import base64
 import json
+import math
 import re
-from typing import Optional
 import cv2
+import networkx as nx
 import numpy as np
 import anthropic
+from shapely.geometry import Point as SPoint, Polygon as SPolygon
 from core.schemas import (
-    BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel
+    BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel, ZoneDefinition
 )
 from core.geometry_utils import px_to_mm
+
+# ─────────────────────────────────────────
+# DXF / DWG 벡터 직접 추출
+# ─────────────────────────────────────────
+
+# 설비 레이어/블록명 → equipment_type 매핑
+_DXF_EQUIPMENT_KEYWORDS: dict[str, str] = {
+    "sprinkler": "sprinkler", "sp": "sprinkler", "spk": "sprinkler",
+    "fire": "fire_extinguisher", "fire_ext": "fire_extinguisher", "fh": "fire_extinguisher",
+    "exit": "exit", "emergency": "exit", "비상구": "exit",
+    "ep": "exit",  # emergency path
+    "출입구": "exit", "entrance": "exit",
+    "panel": "distribution_panel", "elec": "distribution_panel", "dp": "distribution_panel",
+}
+
+
+def _classify_equipment_dxf(name: str) -> str | None:
+    """레이어명/블록명 → equipment_type 분류"""
+    lower = name.lower()
+    for keyword, eq_type in _DXF_EQUIPMENT_KEYWORDS.items():
+        if keyword in lower:
+            return eq_type
+    return None
+
+
+def extract_from_dxf(dxf_bytes: bytes) -> dict | None:
+    """
+    ezdxf로 DXF/DWG 파일 파싱.
+    성공 시 dict 반환, 실패 시 None.
+
+    반환 키:
+      room_polygon_mm  : [(x,y), ...] mm 좌표
+      scale_mm_per_unit: float (1 DXF unit = N mm)
+      equipment_raw    : [{"type": str, "center_mm": (x,y)}]
+      disclaimers      : [str]
+    """
+    import logging
+    try:
+        import ezdxf
+        from ezdxf.math import BoundingBox
+    except ImportError:
+        logging.warning("[Agent2/DXF] ezdxf 미설치 — DXF 파싱 불가")
+        return None
+
+    try:
+        import io, tempfile, os
+        # ezdxf.readfile()이 가장 안정적 — 임시 파일로 저장 후 읽기
+        suffix = ".dxf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(dxf_bytes)
+            tmp_path = tmp.name
+        try:
+            doc = ezdxf.readfile(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        logging.warning(f"[Agent2/DXF] 파일 열기 실패: {e}")
+        return None
+
+    msp = doc.modelspace()
+    disclaimers: list[str] = []
+
+    # ── 1. 단위 결정 ($INSUNITS) ──────────────────────────
+    # 0=없음/인치, 1=인치, 4=mm, 5=cm, 6=m
+    insunits = doc.header.get("$INSUNITS", 4)
+    unit_to_mm: float = {
+        0: 1.0,    # 불명 → mm로 가정
+        1: 25.4,   # 인치
+        2: 304.8,  # 피트
+        4: 1.0,    # mm
+        5: 10.0,   # cm
+        6: 1000.0, # m
+    }.get(insunits, 1.0)
+
+    # ── 2. SCALE 텍스트에서 ratio 추출 ─────────────────────
+    scale_ratio: int | None = None
+    for entity in msp.query("TEXT MTEXT"):
+        try:
+            text = entity.dxf.text if entity.dxftype() == "TEXT" else entity.text
+            m = re.search(r"(?:SCALE\s+)?1\s*[:/]\s*(\d+)", text, re.IGNORECASE)
+            if m:
+                scale_ratio = int(m.group(1))
+                break
+        except Exception:
+            continue
+
+    # mm 단위(insunits=4)이면 scale_ratio 무시 — 좌표가 이미 실제 mm
+    # 단위 불명(0)이고 scale_ratio가 있으면 1unit = scale_ratio mm로 가정
+    if insunits == 4:
+        scale_mm_per_unit = 1.0
+    elif insunits == 0 and scale_ratio:
+        scale_mm_per_unit = float(scale_ratio)
+    else:
+        scale_mm_per_unit = unit_to_mm
+
+    def u2mm(v: float) -> float:
+        return v * scale_mm_per_unit
+
+    logging.info(f"[Agent2/DXF] insunits={insunits} scale_ratio={scale_ratio} → {scale_mm_per_unit:.2f}mm/unit")
+
+    # ── 3. 방 외곽선 — WALL 레이어 또는 가장 큰 폴리라인 ──
+    room_polygon_mm: list[tuple[float, float]] = []
+    best_area = 0.0
+
+    for entity in msp.query("LWPOLYLINE POLYLINE LINE"):
+        layer = entity.dxf.layer.upper()
+
+        # WALL 레이어 폴리라인 우선
+        if entity.dxftype() in ("LWPOLYLINE", "POLYLINE"):
+            try:
+                pts = list(entity.get_points())  # (x, y, ...)
+                if len(pts) < 3:
+                    continue
+                from shapely.geometry import Polygon as SPoly
+                poly_pts = [(p[0], p[1]) for p in pts]
+                try:
+                    area = SPoly(poly_pts).area
+                except Exception:
+                    area = 0
+                if "WALL" in layer or area > best_area:
+                    if "WALL" in layer or area > best_area:
+                        best_area = area
+                        room_polygon_mm = [(u2mm(p[0]), u2mm(p[1])) for p in poly_pts]
+            except Exception:
+                continue
+
+    # LINE 엔티티로만 이뤄진 경우 bbox로 폴백
+    if not room_polygon_mm:
+        xs, ys = [], []
+        for entity in msp.query("LINE"):
+            try:
+                xs += [entity.dxf.start.x, entity.dxf.end.x]
+                ys += [entity.dxf.start.y, entity.dxf.end.y]
+            except Exception:
+                continue
+        if xs and ys:
+            minx, maxx = min(xs), max(xs)
+            miny, maxy = min(ys), max(ys)
+            room_polygon_mm = [
+                (u2mm(minx), u2mm(miny)), (u2mm(maxx), u2mm(miny)),
+                (u2mm(maxx), u2mm(maxy)), (u2mm(minx), u2mm(maxy)),
+            ]
+            disclaimers.append("LINE 엔티티 bbox로 방 외곽 추정 (폴리라인 없음)")
+
+    if not room_polygon_mm:
+        logging.warning("[Agent2/DXF] 방 외곽선을 찾지 못했습니다")
+        return None
+
+    # ── 4. 설비 감지 — 레이어명 + INSERT(블록 삽입점) ──────
+    equipment_raw: list[dict] = []
+
+    # INSERT 엔티티 (블록 심볼)
+    for entity in msp.query("INSERT"):
+        try:
+            block_name = entity.dxf.name
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(block_name) or _classify_equipment_dxf(layer)
+            if eq_type:
+                pos = entity.dxf.insert
+                equipment_raw.append({
+                    "type": eq_type,
+                    "center_mm": (u2mm(pos.x), u2mm(pos.y)),
+                })
+        except Exception:
+            continue
+
+    # CIRCLE 엔티티 (스프링클러 원 심볼)
+    for entity in msp.query("CIRCLE"):
+        try:
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(layer)
+            if eq_type:
+                c = entity.dxf.center
+                equipment_raw.append({
+                    "type": eq_type,
+                    "center_mm": (u2mm(c.x), u2mm(c.y)),
+                })
+        except Exception:
+            continue
+
+    # LWPOLYLINE 사각형 — EXIT 레이어
+    for entity in msp.query("LWPOLYLINE"):
+        try:
+            layer = entity.dxf.layer
+            eq_type = _classify_equipment_dxf(layer)
+            if eq_type and eq_type == "exit":
+                pts = list(entity.get_points())
+                if pts:
+                    cx = sum(p[0] for p in pts) / len(pts)
+                    cy = sum(p[1] for p in pts) / len(pts)
+                    equipment_raw.append({
+                        "type": eq_type,
+                        "center_mm": (u2mm(cx), u2mm(cy)),
+                    })
+        except Exception:
+            continue
+
+    logging.info(f"[Agent2/DXF] 방 외곽 {len(room_polygon_mm)}pts, 설비 {len(equipment_raw)}개, scale={scale_mm_per_unit:.2f}mm/unit")
+
+    return {
+        "room_polygon_mm": room_polygon_mm,
+        "scale_mm_per_unit": scale_mm_per_unit,
+        "equipment_raw": equipment_raw,
+        "disclaimers": disclaimers,
+    }
+
 
 # ─────────────────────────────────────────
 # PDF 벡터 직접 추출 (CAD PDF 전용)
@@ -85,17 +298,62 @@ def extract_from_pdf_vectors(pdf_bytes: bytes) -> dict | None:
         doc.close()
         return None
 
-    # 방 외곽 폴리곤 — items에서 꼭짓점 추출, 없으면 rect 사용
+    # 방 외곽 폴리곤 — items에서 꼭짓점 추출
+    # 직선("l"), 사각형("re"), 3차 베지어 곡선("c") 모두 처리.
+    # 곡선은 BEZIER_SAMPLES 구간으로 샘플링해 다각형 근사 → 원형·타원·곡선 공간 지원.
+    BEZIER_SAMPLES = 14  # 곡선 1개당 샘플 수 (정확도↔속도 트레이드오프)
+
+    def _sample_cubic_bezier(
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+        p3: tuple[float, float],
+        n: int,
+    ) -> list[tuple[float, float]]:
+        """3차 베지어 곡선을 n+1개 점으로 샘플링 (시작점 제외, 끝점 포함)."""
+        pts = []
+        for i in range(1, n + 1):
+            t = i / n
+            mt = 1 - t
+            x = mt**3 * p0[0] + 3 * mt**2 * t * p1[0] + 3 * mt * t**2 * p2[0] + t**3 * p3[0]
+            y = mt**3 * p0[1] + 3 * mt**2 * t * p1[1] + 3 * mt * t**2 * p2[1] + t**3 * p3[1]
+            pts.append((x, y))
+        return pts
+
+    # get_drawings() items 포맷 (PyMuPDF 공식):
+    #   ("l",  p1, p2)           — 직선: 시작점·끝점 명시
+    #   ("c",  p0, p1, p2, p3)  — 3차 베지어: 시작점·제어점1·제어점2·끝점 명시
+    #   ("re", rect)             — 사각형
+    #   ("qu", quad)             — 사각형(quad)
+    # "m"(moveto)은 get_drawings()에 없음 — 모든 아이템이 시작점을 명시적으로 포함
     room_pts: list[tuple[float, float]] = []
+
     for item in room_drawing.get("items", []):
-        if item[0] == "l":          # ('l', Point_start, Point_end)
-            p = item[1]
-            room_pts.append((p.x, p.y))
-        elif item[0] == "re":       # ('re', Rect, ...)
+        kind = item[0]
+
+        if kind == "l":             # ('l', p1, p2) — 직선
+            room_pts.append((item[1].x, item[1].y))
+            room_pts.append((item[2].x, item[2].y))
+
+        elif kind == "c":           # ('c', p0, ctrl1, ctrl2, p3) — 3차 베지어
+            p0    = (item[1].x, item[1].y)
+            ctrl1 = (item[2].x, item[2].y)
+            ctrl2 = (item[3].x, item[3].y)
+            p3    = (item[4].x, item[4].y)
+            # 시작점 포함 + 곡선 샘플링
+            room_pts.append(p0)
+            room_pts.extend(_sample_cubic_bezier(p0, ctrl1, ctrl2, p3, BEZIER_SAMPLES))
+
+        elif kind == "re":          # ('re', Rect) — 사각형
             r2 = item[1]
             room_pts += [(r2.x0, r2.y0), (r2.x1, r2.y0), (r2.x1, r2.y1), (r2.x0, r2.y1)]
 
-    # 중복 제거 + 순서 유지
+        elif kind == "qu":          # ('qu', Quad) — 사각형(quad)
+            q = item[1]
+            room_pts += [(q.ul.x, q.ul.y), (q.ur.x, q.ur.y),
+                         (q.lr.x, q.lr.y), (q.ll.x, q.ll.y)]
+
+    # 중복 제거 + 순서 유지 (연속된 동일 점 제거)
     seen: set = set()
     unique_pts: list[tuple[float, float]] = []
     for p in room_pts:
@@ -104,7 +362,7 @@ def extract_from_pdf_vectors(pdf_bytes: bytes) -> dict | None:
             seen.add(key)
             unique_pts.append(p)
 
-    # 꼭짓점이 3개 미만이면 rect 폴백
+    # 꼭짓점이 3개 미만이면 rect 폴백 (곡선 처리 후에도 실패하는 경우 대비)
     if len(unique_pts) < 3:
         r = room_drawing["rect"]
         unique_pts = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
@@ -164,6 +422,14 @@ VISION_PROMPT = """이 도면 이미지를 분석하여 아래 JSON을 출력하
 {
   "room_bbox_px": [x1, y1, x2, y2],
   "scale_ratio": <"SCALE 1:XX" 또는 "1/XX"에서 XX 숫자, 없으면 null>,
+  "labeled_dimensions": [
+    {
+      "real_mm": <치수선/텍스트에 명시된 실제 mm 값 (예: "5,800mm" → 5800)>,
+      "axis": "x" | "y",
+      "span_px": [start_px, end_px],
+      "confidence": "high" | "medium" | "low"
+    }
+  ],
   "equipment": [
     {
       "equipment_type": "sprinkler" | "fire_extinguisher" | "distribution_panel" | "exit" | "bed" | "desk" | "sofa" | "table" | "chair",
@@ -186,6 +452,10 @@ VISION_PROMPT = """이 도면 이미지를 분석하여 아래 JSON을 출력하
 규칙:
 - room_bbox_px: 방의 내벽 경계를 픽셀 좌표로 표현 (도면 용지 여백 제외)
 - scale_ratio: 예) "SCALE 1:50" → 50, "1/100" → 100
+- labeled_dimensions: 도면에 명시된 치수 텍스트를 모두 추출하세요.
+  예) "5,800mm (전체 폭)" 또는 "12,000mm" → real_mm=5800 또는 12000
+  span_px: 해당 치수가 표시하는 두 끝점의 픽셀 x (axis=x) 또는 y (axis=y) 좌표
+  가장 큰 치수(전체 폭, 전체 높이)를 우선 추출하세요 — 최대 4개
 - 추측 금지, 확인된 값만 기재
 """
 
@@ -265,23 +535,51 @@ def compute_scale(
     """
     px당 mm 배율 계산. 우선순위:
     1. 축척 바 실측 (real_length_mm / pixel_length)
-    2. scale_ratio 텍스트 + 페이지 실제 크기 (mm_per_px × ratio)
-    3. fallback 1.0
+    2. 도면 치수 텍스트 직접 읽기 (labeled_dimensions — 가장 신뢰도 높음)
+    3. scale_ratio 텍스트 + 페이지 실제 크기 (mm_per_px × ratio)
+    4. fallback 1.0
     """
+    import logging
     conf_map = {"high": ConfidenceLevel.HIGH, "medium": ConfidenceLevel.MEDIUM, "low": ConfidenceLevel.LOW}
 
     # 1) 축척 바 실측
     si = vision_result.get("scale_indicator", {})
     if si.get("found") and si.get("real_length_mm") and si.get("pixel_length"):
         scale = si["real_length_mm"] / si["pixel_length"]
+        logging.info(f"[Agent2/Scale] 방법=축척바 scale_mm_per_px={scale:.3f}")
         return scale, conf_map.get(si.get("confidence", "medium"), ConfidenceLevel.MEDIUM)
 
-    # 2) scale_ratio ("1:50" → 50) + 페이지 실제 크기
+    # 2) 치수 텍스트 직접 읽기 — "5,800mm (전체 폭)" 같은 레이블
+    dims = vision_result.get("labeled_dimensions", [])
+    candidates: list[float] = []
+    for d in dims:
+        real_mm = d.get("real_mm")
+        span = d.get("span_px")
+        conf_str = d.get("confidence", "low")
+        if real_mm and span and len(span) == 2 and span[1] > span[0]:
+            px_span = abs(span[1] - span[0])
+            if px_span > 10:  # 너무 짧은 스팬은 노이즈
+                scale_candidate = real_mm / px_span
+                # 합리적인 범위 필터 (0.1mm/px ~ 100mm/px)
+                if 0.1 <= scale_candidate <= 100:
+                    candidates.append(scale_candidate)
+                    logging.info(f"[Agent2/Scale] 치수 후보: real={real_mm}mm span={px_span}px → {scale_candidate:.3f}mm/px (conf={conf_str})")
+    if candidates:
+        # 중앙값 사용 (이상값 제거)
+        candidates.sort()
+        scale = candidates[len(candidates) // 2]
+        logging.info(f"[Agent2/Scale] 방법=치수텍스트 scale_mm_per_px={scale:.3f} (후보 {len(candidates)}개)")
+        return scale, ConfidenceLevel.HIGH
+
+    # 3) scale_ratio ("1:50" → 50) + 페이지 실제 크기
     scale_ratio = vision_result.get("scale_ratio")
     if scale_ratio and image_size_px and page_size_mm:
         mm_per_px_on_paper = page_size_mm[0] / image_size_px[0]
-        return mm_per_px_on_paper * float(scale_ratio), ConfidenceLevel.MEDIUM
+        scale = mm_per_px_on_paper * float(scale_ratio)
+        logging.info(f"[Agent2/Scale] 방법=scale_ratio({scale_ratio}) scale_mm_per_px={scale:.3f}")
+        return scale, ConfidenceLevel.MEDIUM
 
+    logging.warning("[Agent2/Scale] 방법=fallback(1.0) — 스케일 감지 실패")
     return 1.0, ConfidenceLevel.LOW
 
 
@@ -289,85 +587,39 @@ def compute_scale(
 # 후반부: Dead Zone + reference_point
 # ─────────────────────────────────────────
 
-CONSTRAINT_SYSTEM = """당신은 공간 배치 제약 분석 전문가입니다.
-도면 분석 결과를 바탕으로 배치 제약 사항을 자연어로 설명합니다.
-좌표나 mm 숫자 값을 Agent 3에게 전달하지 마세요.
-"""
-
-CONSTRAINT_PROMPT_TEMPLATE = """다음 공간 분석 결과를 바탕으로 배치 제약 사항을 작성하세요.
-
-공간 정보:
-{space_info}
-
-브랜드 기준값:
-{brand_info}
-
-출력 형식 (JSON):
-```json
-{{
-  "natural_language_constraints": "배치 시 고려해야 할 제약 사항을 자연어로 서술",
-  "eligible_objects": ["배치 가능 오브젝트 코드명 목록"],
-  "priority_notes": "우선순위 고려사항"
-}}
-```
-
-규칙:
-- 좌표, 픽셀, mm 숫자 값 절대 포함 금지
-- reference_point 이름(entrance, north_wall_mid 등)으로만 위치 표현
-- eligible_objects는 Supabase furniture_standards 코드명 사용
-"""
-
-
-async def build_constraints(
+def build_constraints(
     floor_analysis: FloorAnalysis,
     standards: BrandStandards,
-    client: anthropic.AsyncAnthropic,
 ) -> dict:
-    """Agent 2 후반부: 자연어 제약 생성 (Agent 3 입력용)"""
-    space_info = {
-        "reference_points": [rp.model_dump() for rp in floor_analysis.reference_points],
+    """
+    Agent 2 후반부: 배치 제약 생성 (결정적 — LLM 호출 없음).
+    공간 분석 결과를 직접 구조화하여 Agent 3에 전달.
+    """
+    zone_summary: dict[str, list[str]] = {"entrance_zone": [], "mid_zone": [], "deep_zone": [], "unknown": []}
+    for rp in floor_analysis.reference_points:
+        zone = rp.zone_label or "unknown"
+        zone_summary.setdefault(zone, []).append(rp.name)
+
+    eq_types = [eq.equipment_type for eq in floor_analysis.equipment_detected]
+    has_exit = any(t in ("exit", "emergency_exit") for t in eq_types)
+
+    parts = [
+        f"설비 {len(floor_analysis.equipment_detected)}개 감지 (dead zone {len(floor_analysis.dead_zones_mm)}개 설정).",
+        f"clearspace {standards.clearspace_mm}mm, 복도 최소폭 {standards.main_corridor_min_mm}mm 유지.",
+    ]
+    if has_exit:
+        parts.append("비상구 인접 구역에 오브젝트 배치 금지.")
+    for zone, names in zone_summary.items():
+        if names and zone != "unknown":
+            parts.append(f"{zone}: {', '.join(names)}.")
+
+    parts.append("오브젝트를 entrance_zone·mid_zone·deep_zone에 고르게 분산 배치하세요.")
+
+    return {
+        "natural_language_constraints": " ".join(parts),
         "eligible_objects": floor_analysis.eligible_objects,
-        "equipment_count": len(floor_analysis.equipment_detected),
-        "dead_zone_count": len(floor_analysis.dead_zones_mm),
-        "disclaimer_count": len(floor_analysis.disclaimer_items),
+        "priority_notes": "캐릭터 조형물은 동선이 확보된 mid_zone 또는 deep_zone 우선. 배너·진열대는 벽 근처 배치 권장.",
     }
-    brand_info = {
-        "clearspace_mm": standards.clearspace_mm,
-        "character_orientation": standards.character_orientation,
-        "prohibited_material": standards.prohibited_material,
-        "main_corridor_min_mm": standards.main_corridor_min_mm,
-    }
-
-    prompt = CONSTRAINT_PROMPT_TEMPLATE.format(
-        space_info=json.dumps(space_info, ensure_ascii=False, indent=2),
-        brand_info=json.dumps(brand_info, ensure_ascii=False, indent=2),
-    )
-
-    response = await client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        system=CONSTRAINT_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    import logging
-    u = response.usage
-    logging.info(f"[Agent2/Constraints] input={u.input_tokens} output={u.output_tokens}")
-
-    raw = response.content[0].text.strip()
-    if "```json" in raw:
-        raw = raw.split("```json")[1].split("```")[0].strip()
-    elif "```" in raw:
-        raw = raw.split("```")[1].split("```")[0].strip()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {
-            "natural_language_constraints": "자동 제약 생성 실패. 기본 규칙 적용.",
-            "eligible_objects": floor_analysis.eligible_objects,
-            "priority_notes": "",
-        }
 
 
 # ─────────────────────────────────────────
@@ -381,12 +633,15 @@ async def run_agent2(
     client: anthropic.AsyncAnthropic,
     page_size_mm: tuple[float, float] | None = None,
     pdf_bytes: bytes | None = None,
+    dxf_bytes: bytes | None = None,
 ) -> tuple[FloorAnalysis, dict, dict]:
     """
     반환: (FloorAnalysis, constraints_dict, image_meta)
 
-    PDF 입력 시: 벡터 직접 추출 → Vision/OpenCV 스킵
-    이미지 입력 시: Vision(Haiku) → OpenCV 폴백
+    처리 경로 우선순위:
+      경로 A-1: DXF/DWG → ezdxf 직접 파싱 (가장 정밀)
+      경로 A-2: PDF     → fitz 벡터 추출
+      경로 B:   이미지  → Vision(Haiku) + OpenCV 폴백
     """
     import logging
 
@@ -398,7 +653,74 @@ async def run_agent2(
     image_size_px: tuple[int, int] | None = None
     room_bbox_px = None
 
-    # ── 경로 A: PDF 벡터 직접 추출 ────────────────────
+    # ── 경로 A-1: DXF/DWG 직접 파싱 ──────────────────
+    if dxf_bytes:
+        dxf_result = extract_from_dxf(dxf_bytes)
+        if dxf_result:
+            logging.info(f"[Agent2/DXF] 성공 — polygon={len(dxf_result['room_polygon_mm'])}pts, "
+                         f"equipment={len(dxf_result['equipment_raw'])}개, "
+                         f"scale={dxf_result['scale_mm_per_unit']:.2f}mm/unit")
+
+            room_polygon_mm = dxf_result["room_polygon_mm"]
+            scale_confidence = ConfidenceLevel.HIGH
+            # DXF는 px 좌표계가 없으므로 scale_mm_per_px를 1로 설정
+            # (렌더링은 mm 좌표 직접 사용)
+            scale_mm_per_px = 1.0
+            disclaimers.extend(dxf_result.get("disclaimers", []))
+
+            for eq in dxf_result["equipment_raw"]:
+                cx_mm, cy_mm = eq["center_mm"]
+                all_equipment.append(Equipment(
+                    equipment_type=eq["type"],
+                    position_px=(cx_mm, cy_mm),   # px 좌표 대신 mm 사용
+                    position_mm=(cx_mm, cy_mm),
+                    confidence=ConfidenceLevel.HIGH,
+                    source="auto_detected",
+                ))
+
+            # 렌더링용 bbox (mm 좌표 = px 좌표, scale=1)
+            xs = [p[0] for p in room_polygon_mm]
+            ys = [p[1] for p in room_polygon_mm]
+            room_bbox_px = [min(xs), min(ys), max(xs), max(ys)]
+            image_size_px = (int(max(xs)), int(max(ys)))
+
+            # 공통 후처리로 진행 (reference_points, dead_zones)
+            reference_points = _generate_reference_points(room_polygon_mm, all_equipment)
+            if user_marked_equipment:
+                for eq in user_marked_equipment:
+                    pos_px = eq["position_px"]
+                    pos_mm = (float(pos_px[0]), float(pos_px[1]))
+                    all_equipment.append(Equipment(
+                        equipment_type=eq["equipment_type"],
+                        position_px=tuple(pos_px),
+                        position_mm=pos_mm,
+                        confidence=ConfidenceLevel.USER_INPUT,
+                        source="user_marked",
+                    ))
+            entrance_pos = next(
+                (rp.position_mm for rp in reference_points if rp.name == "entrance"), None
+            )
+            if entrance_pos:
+                reference_points = _assign_zone_labels(reference_points, room_polygon_mm, entrance_pos)
+            dead_zones_mm = _generate_dead_zones(all_equipment, standards)
+            eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
+            zones = _generate_zones(room_polygon_mm, entrance_pos) if entrance_pos else []
+            floor = FloorAnalysis(
+                room_polygon_mm=room_polygon_mm,
+                dead_zones_mm=dead_zones_mm,
+                reference_points=reference_points,
+                zones=zones,
+                eligible_objects=eligible_objects,
+                scale_mm_per_px=scale_mm_per_px,
+                scale_confidence=scale_confidence,
+                equipment_detected=all_equipment,
+                disclaimer_items=disclaimers,
+            )
+            constraints = build_constraints(floor, standards)
+            image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
+            return floor, constraints, image_meta
+
+    # ── 경로 A-2: PDF 벡터 직접 추출 ─────────────────
     vec = extract_from_pdf_vectors(pdf_bytes) if pdf_bytes else None
 
     if vec:
@@ -499,15 +821,26 @@ async def run_agent2(
                 source="user_marked",
             ))
 
-    # ── 공통: reference_point, dead_zone 생성 ──────────
+    # ── 공통: reference_point, dead_zone, zone 생성 ──────────
     reference_points = _generate_reference_points(room_polygon_mm, all_equipment)
+
+    # NetworkX 보행 거리 계산 → zone_label 할당
+    entrance_pos = next(
+        (rp.position_mm for rp in reference_points if rp.name == "entrance"),
+        None,
+    )
+    if entrance_pos:
+        reference_points = _assign_zone_labels(reference_points, room_polygon_mm, entrance_pos)
+
     dead_zones_mm = _generate_dead_zones(all_equipment, standards)
     eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
+    zones = _generate_zones(room_polygon_mm, entrance_pos) if entrance_pos else []
 
     floor = FloorAnalysis(
         room_polygon_mm=room_polygon_mm,
         dead_zones_mm=dead_zones_mm,
         reference_points=reference_points,
+        zones=zones,
         eligible_objects=eligible_objects,
         scale_mm_per_px=scale_mm_per_px,
         scale_confidence=scale_confidence,
@@ -515,10 +848,163 @@ async def run_agent2(
         disclaimer_items=disclaimers,
     )
 
-    constraints = await build_constraints(floor, standards, client)
+    constraints = build_constraints(floor, standards)
 
     image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
     return floor, constraints, image_meta
+
+
+def _generate_zones(
+    room_polygon_mm: list[tuple[float, float]],
+    entrance_pos: tuple[float, float],
+    grid_mm: float = 200.0,
+) -> list[ZoneDefinition]:
+    """
+    보행 거리 그리드 기반으로 방을 3개 zone 폴리곤으로 분할.
+    각 격자 노드를 entrance_zone / mid_zone / deep_zone으로 분류하고
+    Shapely convex_hull로 zone 폴리곤 생성.
+    비볼록 공간(ㄱ자 등)에서도 room_polygon과 교차(intersection)하여
+    폴리곤 밖 영역이 포함되지 않도록 처리.
+    """
+    if not room_polygon_mm or len(room_polygon_mm) < 3:
+        return []
+
+    try:
+        from shapely.ops import unary_union
+        from shapely.geometry import MultiPoint
+
+        room_poly = SPolygon(room_polygon_mm)
+        minx, miny, maxx, maxy = room_poly.bounds
+        step = int(grid_mm)
+
+        G: nx.Graph = nx.Graph()
+        node_set: set[tuple[int, int]] = set()
+        for x in range(int(minx), int(maxx) + step, step):
+            for y in range(int(miny), int(maxy) + step, step):
+                if room_poly.contains(SPoint(x, y)):
+                    G.add_node((x, y))
+                    node_set.add((x, y))
+
+        for (x, y) in list(G.nodes()):
+            for dx, dy in [(step, 0), (0, step), (step, step), (-step, step)]:
+                nb = (x + dx, y + dy)
+                if nb in node_set:
+                    G.add_edge((x, y), nb, weight=math.sqrt(dx ** 2 + dy ** 2))
+
+        if not G.nodes():
+            return []
+
+        entrance_node = min(
+            G.nodes(),
+            key=lambda n: (n[0] - entrance_pos[0]) ** 2 + (n[1] - entrance_pos[1]) ** 2,
+        )
+        walk_dists: dict = nx.single_source_dijkstra_path_length(G, entrance_node, weight="weight")
+        max_dist = max(walk_dists.values()) if walk_dists else 1.0
+
+        buckets: dict[str, list[tuple[float, float]]] = {
+            "entrance_zone": [],
+            "mid_zone": [],
+            "deep_zone": [],
+        }
+        for node, dist in walk_dists.items():
+            ratio = dist / max_dist if max_dist > 0 else 0.0
+            label = "entrance_zone" if ratio < 0.33 else ("mid_zone" if ratio < 0.67 else "deep_zone")
+            buckets[label].append((float(node[0]), float(node[1])))
+
+        zones: list[ZoneDefinition] = []
+        for label, points in buckets.items():
+            if len(points) < 3:
+                continue
+            hull = MultiPoint(points).convex_hull
+            # 방 폴리곤 밖으로 나가지 않도록 교차
+            clipped = hull.intersection(room_poly)
+            if clipped.is_empty:
+                continue
+            coords = list(clipped.exterior.coords) if hasattr(clipped, "exterior") else []
+            if not coords:
+                continue
+            zones.append(ZoneDefinition(
+                name=label,
+                polygon_mm=[(float(x), float(y)) for x, y in coords],
+                label=label,
+                allowed_objects=None,
+                source="auto",
+            ))
+
+        return zones
+
+    except Exception:
+        return []
+
+
+def _assign_zone_labels(
+    reference_points: list[ReferencePoint],
+    room_polygon_mm: list[tuple[float, float]],
+    entrance_pos: tuple[float, float],
+    grid_mm: float = 200.0,
+) -> list[ReferencePoint]:
+    """
+    NetworkX 격자 그래프로 입구→각 기준점 보행 거리 계산.
+    거리 비율로 zone_label 할당:
+      0~33%  → entrance_zone
+      33~67% → mid_zone
+      67~100%→ deep_zone
+    """
+    if not room_polygon_mm or len(room_polygon_mm) < 3:
+        return reference_points
+
+    try:
+        room_poly = SPolygon(room_polygon_mm)
+        minx, miny, maxx, maxy = room_poly.bounds
+        step = int(grid_mm)
+
+        # 방 내부 격자 노드 생성
+        G: nx.Graph = nx.Graph()
+        node_set: set[tuple[int, int]] = set()
+        for x in range(int(minx), int(maxx) + step, step):
+            for y in range(int(miny), int(maxy) + step, step):
+                if room_poly.contains(SPoint(x, y)):
+                    G.add_node((x, y))
+                    node_set.add((x, y))
+
+        # 4방향 + 대각선 엣지
+        for (x, y) in list(G.nodes()):
+            for dx, dy in [(step, 0), (0, step), (step, step), (-step, step)]:
+                nb = (x + dx, y + dy)
+                if nb in node_set:
+                    G.add_edge((x, y), nb, weight=math.sqrt(dx ** 2 + dy ** 2))
+
+        if not G.nodes():
+            return reference_points
+
+        # 입구에서 가장 가까운 노드
+        entrance_node = min(
+            G.nodes(),
+            key=lambda n: (n[0] - entrance_pos[0]) ** 2 + (n[1] - entrance_pos[1]) ** 2,
+        )
+        walk_dists: dict = nx.single_source_dijkstra_path_length(G, entrance_node, weight="weight")
+        max_dist = max(walk_dists.values()) if walk_dists else 1.0
+
+        updated: list[ReferencePoint] = []
+        for rp in reference_points:
+            nearest = min(
+                G.nodes(),
+                key=lambda n: (n[0] - rp.position_mm[0]) ** 2 + (n[1] - rp.position_mm[1]) ** 2,
+            )
+            dist = walk_dists.get(nearest, max_dist)
+            ratio = dist / max_dist if max_dist > 0 else 0.0
+            zone = "entrance_zone" if ratio < 0.33 else ("mid_zone" if ratio < 0.67 else "deep_zone")
+            updated.append(ReferencePoint(
+                name=rp.name,
+                position_mm=rp.position_mm,
+                facing=rp.facing,
+                zone_label=zone,
+                walk_distance_mm=round(dist, 1),
+            ))
+        return updated
+
+    except Exception:
+        return reference_points
 
 
 def _generate_reference_points(
@@ -562,19 +1048,49 @@ def _generate_dead_zones(
     equipment: list[Equipment],
     standards: BrandStandards,
 ) -> list[list[tuple[float, float]]]:
-    """설비 주변 Dead Zone — position_mm 직접 사용"""
+    """
+    설비 주변 Dead Zone — position_mm 직접 사용.
+
+    비상구(exit/emergency_exit):
+      - 비상구 직접 인접 구역: emergency_path_min_mm(기본 1200mm) 반경 사각형
+      - 비상구 앞 동선 확보: 비상구 내측 방향으로 emergency_path_min_mm × (emergency_path_min_mm*2) 직사각형
+    기타 설비: wall_clearance_mm 반경 사각형
+    """
     dead_zones = []
-    radius = standards.wall_clearance_mm
     for eq in equipment:
         if eq.position_mm is None:
             continue
         mx, my = eq.position_mm
-        dead_zones.append([
-            (mx - radius, my - radius),
-            (mx + radius, my - radius),
-            (mx + radius, my + radius),
-            (mx - radius, my + radius),
-        ])
+
+        if eq.equipment_type in ("exit", "emergency_exit"):
+            # ① 비상구 직접 인접 사각 Dead Zone (1200mm 반경)
+            r = standards.emergency_path_min_mm
+            dead_zones.append([
+                (mx - r, my - r),
+                (mx + r, my - r),
+                (mx + r, my + r),
+                (mx - r, my + r),
+            ])
+            # ② 비상구 앞 통로 Dead Zone: 비상구에서 실내 방향으로 추가 1200mm 확보
+            # 비상구는 보통 벽 경계에 있으므로 내측(y 감소 방향)으로 복도를 확보
+            corridor_depth = standards.emergency_path_min_mm  # 1200mm 추가
+            dead_zones.append([
+                (mx - r / 2, my - r - corridor_depth),
+                (mx + r / 2, my - r - corridor_depth),
+                (mx + r / 2, my - r),
+                (mx - r / 2, my - r),
+            ])
+        elif eq.equipment_type == "sprinkler":
+            # 스프링클러는 Dead Zone 미적용 — 천장 설비로 바닥 배치에 영향 없음
+            continue
+        else:
+            radius = standards.wall_clearance_mm
+            dead_zones.append([
+                (mx - radius, my - radius),
+                (mx + radius, my - radius),
+                (mx + radius, my + radius),
+                (mx - radius, my + radius),
+            ])
     return dead_zones
 
 
