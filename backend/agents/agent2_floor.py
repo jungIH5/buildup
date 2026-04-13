@@ -22,7 +22,7 @@ import numpy as np
 import anthropic
 from shapely.geometry import Point as SPoint, Polygon as SPolygon
 from core.schemas import (
-    BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel
+    BrandStandards, FloorAnalysis, Equipment, ReferencePoint, ConfidenceLevel, ZoneDefinition
 )
 from core.geometry_utils import px_to_mm
 
@@ -704,10 +704,12 @@ async def run_agent2(
                 reference_points = _assign_zone_labels(reference_points, room_polygon_mm, entrance_pos)
             dead_zones_mm = _generate_dead_zones(all_equipment, standards)
             eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
+            zones = _generate_zones(room_polygon_mm, entrance_pos) if entrance_pos else []
             floor = FloorAnalysis(
                 room_polygon_mm=room_polygon_mm,
                 dead_zones_mm=dead_zones_mm,
                 reference_points=reference_points,
+                zones=zones,
                 eligible_objects=eligible_objects,
                 scale_mm_per_px=scale_mm_per_px,
                 scale_confidence=scale_confidence,
@@ -819,7 +821,7 @@ async def run_agent2(
                 source="user_marked",
             ))
 
-    # ── 공통: reference_point, dead_zone 생성 ──────────
+    # ── 공통: reference_point, dead_zone, zone 생성 ──────────
     reference_points = _generate_reference_points(room_polygon_mm, all_equipment)
 
     # NetworkX 보행 거리 계산 → zone_label 할당
@@ -832,11 +834,13 @@ async def run_agent2(
 
     dead_zones_mm = _generate_dead_zones(all_equipment, standards)
     eligible_objects = ["character_bbox", "shelf_rental", "photo_zone", "banner_stand", "product_display"]
+    zones = _generate_zones(room_polygon_mm, entrance_pos) if entrance_pos else []
 
     floor = FloorAnalysis(
         room_polygon_mm=room_polygon_mm,
         dead_zones_mm=dead_zones_mm,
         reference_points=reference_points,
+        zones=zones,
         eligible_objects=eligible_objects,
         scale_mm_per_px=scale_mm_per_px,
         scale_confidence=scale_confidence,
@@ -848,6 +852,89 @@ async def run_agent2(
 
     image_meta = {"image_size_px": image_size_px, "room_bbox_px": room_bbox_px}
     return floor, constraints, image_meta
+
+
+def _generate_zones(
+    room_polygon_mm: list[tuple[float, float]],
+    entrance_pos: tuple[float, float],
+    grid_mm: float = 200.0,
+) -> list[ZoneDefinition]:
+    """
+    보행 거리 그리드 기반으로 방을 3개 zone 폴리곤으로 분할.
+    각 격자 노드를 entrance_zone / mid_zone / deep_zone으로 분류하고
+    Shapely convex_hull로 zone 폴리곤 생성.
+    비볼록 공간(ㄱ자 등)에서도 room_polygon과 교차(intersection)하여
+    폴리곤 밖 영역이 포함되지 않도록 처리.
+    """
+    if not room_polygon_mm or len(room_polygon_mm) < 3:
+        return []
+
+    try:
+        from shapely.ops import unary_union
+        from shapely.geometry import MultiPoint
+
+        room_poly = SPolygon(room_polygon_mm)
+        minx, miny, maxx, maxy = room_poly.bounds
+        step = int(grid_mm)
+
+        G: nx.Graph = nx.Graph()
+        node_set: set[tuple[int, int]] = set()
+        for x in range(int(minx), int(maxx) + step, step):
+            for y in range(int(miny), int(maxy) + step, step):
+                if room_poly.contains(SPoint(x, y)):
+                    G.add_node((x, y))
+                    node_set.add((x, y))
+
+        for (x, y) in list(G.nodes()):
+            for dx, dy in [(step, 0), (0, step), (step, step), (-step, step)]:
+                nb = (x + dx, y + dy)
+                if nb in node_set:
+                    G.add_edge((x, y), nb, weight=math.sqrt(dx ** 2 + dy ** 2))
+
+        if not G.nodes():
+            return []
+
+        entrance_node = min(
+            G.nodes(),
+            key=lambda n: (n[0] - entrance_pos[0]) ** 2 + (n[1] - entrance_pos[1]) ** 2,
+        )
+        walk_dists: dict = nx.single_source_dijkstra_path_length(G, entrance_node, weight="weight")
+        max_dist = max(walk_dists.values()) if walk_dists else 1.0
+
+        buckets: dict[str, list[tuple[float, float]]] = {
+            "entrance_zone": [],
+            "mid_zone": [],
+            "deep_zone": [],
+        }
+        for node, dist in walk_dists.items():
+            ratio = dist / max_dist if max_dist > 0 else 0.0
+            label = "entrance_zone" if ratio < 0.33 else ("mid_zone" if ratio < 0.67 else "deep_zone")
+            buckets[label].append((float(node[0]), float(node[1])))
+
+        zones: list[ZoneDefinition] = []
+        for label, points in buckets.items():
+            if len(points) < 3:
+                continue
+            hull = MultiPoint(points).convex_hull
+            # 방 폴리곤 밖으로 나가지 않도록 교차
+            clipped = hull.intersection(room_poly)
+            if clipped.is_empty:
+                continue
+            coords = list(clipped.exterior.coords) if hasattr(clipped, "exterior") else []
+            if not coords:
+                continue
+            zones.append(ZoneDefinition(
+                name=label,
+                polygon_mm=[(float(x), float(y)) for x, y in coords],
+                label=label,
+                allowed_objects=None,
+                source="auto",
+            ))
+
+        return zones
+
+    except Exception:
+        return []
 
 
 def _assign_zone_labels(

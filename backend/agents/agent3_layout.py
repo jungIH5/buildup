@@ -12,9 +12,10 @@ import anthropic
 from pydantic import ValidationError
 from core.schemas import (
     FloorAnalysis, BrandStandards, LayoutPlan,
-    LayoutResult,
+    LayoutResult, PlacementIntent,
 )
 from core.spatial import compute_layout, make_object_polygon
+from core.intent_parser import ResolvedIntent
 from shapely.geometry import Polygon
 
 MAX_RETRIES = 2
@@ -135,18 +136,19 @@ def _compute_wall_capacity(
     room_polygon_mm: list,
     obj_w: float,
     gap_mm: float = 50.0,
-    clearspace_mm: float = 600.0,
+    wall_clearance_mm: float = 300.0,
 ) -> int:
     """
     가장 긴 벽 한 면에 단열로 배치 가능한 최대 개수.
-    - 브랜드 clearspace를 오브젝트 간격이 아닌 끝단 여유로 적용
+    - 끝단 여유는 wall_clearance_mm(설비 이격 기준, 양쪽 각 300mm)만 적용
+    - clearspace_mm(통행폭)은 진열대 앞 통로 보장에만 사용되므로 수량 계산에 미포함
     - 실제 배치 시 dead_zone·통로 체크에서 추가 제한될 수 있음
     """
     xs = [p[0] for p in room_polygon_mm]
     ys = [p[1] for p in room_polygon_mm]
     longest = max(max(xs) - min(xs), max(ys) - min(ys))
-    # 양쪽 끝 여유 = clearspace_mm, 오브젝트 사이 간격 = gap_mm
-    effective = longest - clearspace_mm * 2
+    # 양쪽 끝 여유 = wall_clearance_mm(각 300mm), 오브젝트 사이 간격 = gap_mm
+    effective = longest - wall_clearance_mm * 2
     return max(1, int(effective / (obj_w + gap_mm)))
 
 
@@ -205,6 +207,7 @@ async def run_agent3(
     relationships: list[dict] | None = None,
     user_requirements: str | None = None,
     existing_placed: list | None = None,
+    resolved_intents: list[ResolvedIntent] | None = None,
 ) -> LayoutResult:
     """
     Agent 3 메인 진입점.
@@ -244,8 +247,8 @@ async def run_agent3(
     all_violations: list = []
 
     # ── 사용자 요구사항 파싱 ──
-    # Claude Haiku로 자연어에서 수량을 추출. 정규식 패턴 의존 없이 맥락 기반 인식.
     user_requirements_section = ""
+    forced_refs: dict[str, str] = {}   # object_type → forced reference_point name
 
     # 기본 수량: eligible_objects의 각 타입은 기본 1개
     base_counts: dict[str, int] = {}
@@ -253,23 +256,67 @@ async def run_agent3(
         base_counts[obj] = base_counts.get(obj, 0) + 1
 
     qty_overrides: dict[str, int] = {}
-    if user_requirements and user_requirements.strip():
+
+    if resolved_intents:
+        # ── Intent Parser 결과 사용 (우선) ──────────────────────────────
+        for intent in resolved_intents:
+            obj_type = intent.object_type
+            qty = intent.quantity
+
+            # fill 신호(-1) 처리
+            if qty == _FILL_SIGNAL and obj_type in furniture_sizes:
+                obj_w = furniture_sizes[obj_type][0]
+                qty = _compute_wall_capacity(
+                    floor.room_polygon_mm,
+                    obj_w,
+                    gap_mm=50.0,
+                    wall_clearance_mm=max(standards.wall_clearance_mm, 300.0),
+                )
+            if qty > 0:
+                qty_overrides[obj_type] = max(qty_overrides.get(obj_type, 0), qty)
+
+            # 강제 기준점 등록
+            if intent.target_ref_point:
+                forced_refs[obj_type] = intent.target_ref_point
+
+        # 프롬프트용 요구사항 섹션 구성
+        intent_lines = []
+        for intent in resolved_intents:
+            qty_label = "최대 수량" if intent.quantity == _FILL_SIGNAL else f"{qty_overrides.get(intent.object_type, 1)}개"
+            ref_note = f" → 기준점 강제: {forced_refs[intent.object_type]}" if intent.object_type in forced_refs else ""
+            intent_lines.append(f"- {intent.object_type} {qty_label}: {intent.original_text}{ref_note}")
+
+        forced_section = ""
+        if forced_refs:
+            forced_lines = [
+                f"  * {obj_type} → 반드시 '{ref_name}' 기준점 사용"
+                for obj_type, ref_name in forced_refs.items()
+            ]
+            forced_section = (
+                "\n★ 강제 기준점 (Intent Parser 지정 — 변경 불가):\n"
+                + "\n".join(forced_lines)
+                + "\n"
+            )
+
+        user_requirements_section = USER_REQUIREMENTS_TEMPLATE.format(
+            requirements="\n".join(intent_lines) + forced_section
+        )
+
+    elif user_requirements and user_requirements.strip():
+        # ── 폴백: 기존 자연어 직접 파싱 ─────────────────────────────────
         user_requirements_section = USER_REQUIREMENTS_TEMPLATE.format(
             requirements=user_requirements.strip()
         )
-        # AI 파서로 자연어 수량 추출 (등신대, 피규어 등 다양한 표현 처리)
         qty_overrides = await _parse_qty_with_ai(user_requirements.strip(), client)
 
-        # fill 신호(-1) 처리: 벽 용량 자동 계산
         for obj_type, qty in list(qty_overrides.items()):
             if qty == _FILL_SIGNAL and obj_type in furniture_sizes:
                 obj_w = furniture_sizes[obj_type][0]
-                gap_mm = 50.0
                 max_qty = _compute_wall_capacity(
                     floor.room_polygon_mm,
                     obj_w,
-                    gap_mm=gap_mm,
-                    clearspace_mm=max(standards.clearspace_mm, 600.0),
+                    gap_mm=50.0,
+                    wall_clearance_mm=max(standards.wall_clearance_mm, 300.0),
                 )
                 qty_overrides[obj_type] = max_qty
 
@@ -357,6 +404,12 @@ async def run_agent3(
                     "reference_point": "unknown",
                 })
             break
+
+        # 강제 기준점 덮어쓰기 — Intent Parser가 지정한 ref_point를 LLM 출력보다 우선
+        if forced_refs:
+            for placement in layout_plan.placements:
+                if placement.object_type in forced_refs:
+                    placement.reference_point = forced_refs[placement.object_type]
 
         # Shapely 배치 계산 — 이전 라운드 배치 폴리곤을 initial로 전달
         result = compute_layout(

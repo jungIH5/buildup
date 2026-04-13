@@ -14,6 +14,7 @@ from agents.agent1_brand import run_agent1
 from agents.agent2_floor import run_agent2
 from agents.agent3_layout import run_agent3
 from core.schemas import LayoutResult, FloorAnalysis, BrandStandards
+from core.intent_parser import parse_intents
 
 router = APIRouter()
 
@@ -45,9 +46,11 @@ async def run_pipeline(
     floor_plan: Optional[UploadFile] = File(None, description="도면 파일 — 이미지/PDF/DXF/DWG (선택사항)"),
     user_markings: Optional[str] = Form(None, description="사용자 마킹 JSON 문자열"),
     user_requirements: Optional[str] = Form(None, description="사용자 배치 요구사항 자유 텍스트"),
+    pre_analyzed_floor: Optional[str] = Form(None, description="/analyze 결과 캐시 JSON — 있으면 Agent 2 스킵"),
 ):
     """
-    Agent 1 → Agent 2 → Agent 3 전체 파이프라인 실행.
+    Agent 1 → (Agent 2) → Agent 3 전체 파이프라인 실행.
+    pre_analyzed_floor가 있으면 Agent 2를 스킵하고 해당 분석 결과를 사용.
     도면 포맷: 이미지(PNG/JPG) · PDF · DXF · DWG 모두 지원.
     """
     client = request.app.state.anthropic
@@ -66,6 +69,19 @@ async def run_pipeline(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="user_markings JSON 파싱 실패")
 
+    # pre_analyzed_floor 파싱 (있으면 Agent 2 스킵)
+    pre_floor: FloorAnalysis | None = None
+    pre_constraints: dict | None = None
+    pre_image_meta: dict | None = None
+    if pre_analyzed_floor:
+        try:
+            cached = json.loads(pre_analyzed_floor)
+            pre_floor = FloorAnalysis(**cached["floor"])
+            pre_constraints = cached["constraints"]
+            pre_image_meta = cached.get("image_meta", {})
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"pre_analyzed_floor 파싱 실패: {e}")
+
     # Agent 1
     try:
         if pdf_bytes:
@@ -78,10 +94,14 @@ async def run_pipeline(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Agent 1 실패: {e}")
 
-    # Agent 2
+    # Agent 2 (pre_analyzed_floor 있으면 스킵)
     floor_png_b64: str | None = None
     try:
-        if floor_plan:
+        if pre_floor is not None:
+            floor = pre_floor
+            constraints = pre_constraints
+            image_meta = pre_image_meta or {}
+        elif floor_plan:
             floor_bytes = image_bytes
             filename = floor_plan.filename or ""
             content_type = floor_plan.content_type or ""
@@ -131,7 +151,7 @@ async def run_pipeline(
                 )
         else:
             # 도면이 없을 때: 10m x 8m 가상 샘플 공간 생성
-            from agents.agent2_floor import FloorAnalysis, ReferencePoint, ConfidenceLevel
+            from agents.agent2_floor import ReferencePoint, ConfidenceLevel
             room_poly = [(0, 0), (10000, 0), (10000, 8000), (0, 8000)]
             floor = FloorAnalysis(
                 room_polygon_mm=room_poly,
@@ -158,6 +178,15 @@ async def run_pipeline(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Agent 2 실패: {e}")
 
+    # Intent Parser — Agent 2 공간 정보 기반으로 자연어 요구사항 구조화
+    resolved_intents = None
+    if user_requirements and user_requirements.strip():
+        try:
+            resolved_intents = await parse_intents(user_requirements, floor, client)
+        except Exception as e:
+            import logging
+            logging.warning(f"[Pipeline] Intent Parser 실패 (폴백 사용): {e}")
+
     # Agent 3
     try:
         # 비상구 좌표 추출 (check_emergency_path 활성화)
@@ -176,6 +205,7 @@ async def run_pipeline(
             emergency_exits=emergency_exits if emergency_exits else None,
             relationships=standards.relationships if standards.relationships else None,
             user_requirements=user_requirements,
+            resolved_intents=resolved_intents,
         )
     except Exception as e:
         import traceback
@@ -242,6 +272,14 @@ async def layout_only(request: Request, body: LayoutOnlyRequest):
         if body.emergency_exits else None
     )
 
+    resolved_intents = None
+    if body.user_requirements and body.user_requirements.strip():
+        try:
+            resolved_intents = await parse_intents(body.user_requirements, floor, client)
+        except Exception as e:
+            import logging
+            logging.warning(f"[Pipeline/layout_only] Intent Parser 실패 (폴백 사용): {e}")
+
     try:
         result: LayoutResult = await run_agent3(
             floor=floor,
@@ -253,6 +291,7 @@ async def layout_only(request: Request, body: LayoutOnlyRequest):
             relationships=standards.relationships if standards.relationships else None,
             user_requirements=body.user_requirements,
             existing_placed=body.existing_placed or None,
+            resolved_intents=resolved_intents,
         )
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -280,10 +319,10 @@ async def agent2_review(
     user_markings: Optional[str] = Form(None),
 ):
     """
-    Agent 2 결과만 반환 (사용자 확인 단계용).
-    Dead Zone + reference_points (zone_label 포함) + eligible_objects 시각화 데이터 제공.
+    Agent 2 결과만 반환 (도면 업로드 → 사용자 확인 단계용).
+    zones(entrance/mid/deep_zone 폴리곤) + dead_zones + reference_points 반환.
+    _cache 필드에 FloorAnalysis + constraints 포함 → /run의 pre_analyzed_floor로 그대로 전달 가능.
     """
-    from core.schemas import BrandStandards
     client = request.app.state.anthropic
     image_bytes = await floor_plan.read()
     standards = BrandStandards()
@@ -295,10 +334,22 @@ async def agent2_review(
         except json.JSONDecodeError:
             pass
 
-    # PDF이면 PNG 변환
+    # DXF/DWG 경로
+    filename = floor_plan.filename or ""
+    content_type = floor_plan.content_type or ""
     page_size_mm = None
     original_pdf_bytes = None
-    if floor_plan.content_type == "application/pdf" or floor_plan.filename.lower().endswith(".pdf"):
+    floor_png_b64 = None
+
+    if _is_dxf_file(filename, content_type):
+        floor, constraints, image_meta = await run_agent2(
+            image_bytes=b"",
+            standards=standards,
+            user_marked_equipment=markings,
+            client=request.app.state.anthropic,
+            dxf_bytes=image_bytes,
+        )
+    elif filename.lower().endswith(".pdf") or content_type == "application/pdf":
         import fitz
         original_pdf_bytes = image_bytes
         doc = fitz.open(stream=image_bytes, filetype="pdf")
@@ -307,24 +358,40 @@ async def agent2_review(
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         image_bytes = pix.tobytes("png")
         doc.close()
-
-    floor, constraints, _ = await run_agent2(
-        image_bytes=image_bytes,
-        standards=standards,
-        user_marked_equipment=markings,
-        client=client,
-        page_size_mm=page_size_mm,
-        pdf_bytes=original_pdf_bytes,
-    )
+        floor_png_b64 = base64.b64encode(image_bytes).decode()
+        floor, constraints, image_meta = await run_agent2(
+            image_bytes=image_bytes,
+            standards=standards,
+            user_marked_equipment=markings,
+            client=client,
+            page_size_mm=page_size_mm,
+            pdf_bytes=original_pdf_bytes,
+        )
+    else:
+        floor_png_b64 = base64.b64encode(image_bytes).decode()
+        floor, constraints, image_meta = await run_agent2(
+            image_bytes=image_bytes,
+            standards=standards,
+            user_marked_equipment=markings,
+            client=client,
+        )
 
     return JSONResponse(content={
+        # 시각화용 데이터
         "room_polygon_mm": floor.room_polygon_mm,
         "dead_zones_mm": floor.dead_zones_mm,
+        "zones": [z.model_dump() for z in floor.zones],
         "reference_points": [rp.model_dump() for rp in floor.reference_points],
         "eligible_objects": floor.eligible_objects,
         "scale_mm_per_px": floor.scale_mm_per_px,
         "scale_confidence": floor.scale_confidence.value,
         "equipment_detected": [eq.model_dump() for eq in floor.equipment_detected],
         "disclaimer_items": floor.disclaimer_items,
-        "constraints_preview": constraints,
+        "floor_plan_png": floor_png_b64,
+        # /run의 pre_analyzed_floor로 그대로 전달할 캐시
+        "_cache": {
+            "floor": floor.model_dump(),
+            "constraints": constraints,
+            "image_meta": image_meta,
+        },
     })

@@ -38,6 +38,7 @@ interface ThreeViewerProps {
   imageSizePx?: [number, number];
   selectedIndices?: number[];
   selectedWallId?: string | null;
+  collidingIndices?: Set<number>;
   onObjectClick?: (index: number | null, shiftKey?: boolean) => void;
   onWallClick?: (id: string | null) => void;
   onObjectMove?: (index: number, x: number, z: number) => void;
@@ -50,13 +51,14 @@ const OBJECT_COLORS: Record<string, number> = {
   character_bbox: 0x6366f1, photo_zone: 0x10b981,
   shelf_rental: 0xec4899, banner_stand: 0xf59e0b, product_display: 0x3b82f6,
 };
-const SELECTED_COLOR = 0xffd700;
-const WALL_COLOR     = 0x94a3b8;
+const SELECTED_COLOR  = 0xffd700;
+const COLLIDE_COLOR   = 0xef4444;
+const WALL_COLOR      = 0x94a3b8;
 
 const ThreeViewer: React.FC<ThreeViewerProps> = ({
   roomPolygon, placedObjects, detectedObjects = [], walls = [],
   floorPlanUrl, roomBboxPx, imageSizePx,
-  selectedIndices = [], selectedWallId,
+  selectedIndices = [], selectedWallId, collidingIndices = new Set(),
   onObjectClick, onWallClick, onObjectMove, onObjectMoveMulti, onWallMove, onObjectRotate,
 }) => {
   const mountRef      = useRef<HTMLDivElement>(null);
@@ -90,11 +92,12 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
     placedMeshes.current.forEach((mesh, i) => {
       const mat = mesh.material as THREE.MeshStandardMaterial;
       const isSel = selectedIndices.includes(i);
-      mat.color.setHex(isSel ? SELECTED_COLOR : (OBJECT_COLORS[placedObjects[i]?.object_type] ?? 0xec4899));
-      mat.emissive.setHex(isSel ? 0x554400 : 0x000000);
+      const isCol = collidingIndices.has(i);
+      mat.color.setHex(isSel ? SELECTED_COLOR : isCol ? COLLIDE_COLOR : (OBJECT_COLORS[placedObjects[i]?.object_type] ?? 0xec4899));
+      mat.emissive.setHex(isSel ? 0x554400 : isCol ? 0x550000 : 0x000000);
       mat.needsUpdate = true;
     });
-  }, [selectedIndices, placedObjects]);
+  }, [selectedIndices, collidingIndices, placedObjects]);
 
   // ── Highlight: walls ──
   useEffect(() => {
@@ -297,9 +300,10 @@ const ThreeViewer: React.FC<ThreeViewerProps> = ({
       const [w,d] = obj.bbox_mm, h = obj.height_mm ?? 1500;
       const geo = new THREE.BoxGeometry(w,h,d);
       const isSel = selectedIndices.includes(i);
+      const isCol = collidingIndices.has(i);
       const mat = new THREE.MeshStandardMaterial({
-        color: isSel ? SELECTED_COLOR : (OBJECT_COLORS[obj.object_type] ?? 0xec4899),
-        emissive: isSel ? 0x554400 : 0x000000,
+        color: isSel ? SELECTED_COLOR : isCol ? COLLIDE_COLOR : (OBJECT_COLORS[obj.object_type] ?? 0xec4899),
+        emissive: isSel ? 0x554400 : isCol ? 0x550000 : 0x000000,
         transparent: true, opacity: 0.85, roughness: 0.3, metalness: 0.4,
       });
       geos.push(geo); mats.push(mat);

@@ -150,7 +150,6 @@ def _score_position(
 
 def build_dead_zones(
     floor: FloorAnalysis,
-    standards: BrandStandards,
 ) -> list[Polygon]:
     """
     Dead Zone 폴리곤 목록 생성:
@@ -227,6 +226,40 @@ def _is_accessible(
     return False
 
 
+def _build_zone_constraints(
+    floor: "FloorAnalysis",
+) -> list[tuple["Polygon", list[str] | None]]:
+    """
+    ZoneDefinition 목록 → (zone_polygon, allowed_objects) 튜플 목록.
+    allowed_objects=None 인 zone은 제약 없으므로 제외.
+    """
+    from shapely.geometry import Polygon as _Poly
+    result = []
+    for zone in floor.zones:
+        if zone.allowed_objects is None:
+            continue  # 제약 없음
+        if len(zone.polygon_mm) < 3:
+            continue
+        result.append((_Poly(zone.polygon_mm), zone.allowed_objects))
+    return result
+
+
+def _zone_allows(
+    obj_poly: "Polygon",
+    object_type: str,
+    zone_constraints: list[tuple["Polygon", list[str] | None]],
+) -> bool:
+    """
+    오브젝트 폴리곤이 제약 zone과 겹치면 → allowed_objects에 object_type이 있어야 통과.
+    겹치는 zone이 없으면 → 통과 (제약 없음).
+    """
+    for zone_poly, allowed in zone_constraints:
+        if obj_poly.intersects(zone_poly):
+            if object_type not in (allowed or []):
+                return False
+    return True
+
+
 def try_place_object(
     cx: float, cy: float,
     width_mm: float, height_mm: float,
@@ -238,6 +271,8 @@ def try_place_object(
     entrance_pos: tuple[float, float] | None = None,
     clearspace_mm: float = MIN_ACCESS_GAP_MM,
     check_access: bool = True,
+    zone_constraints: list[tuple[Polygon, list[str] | None]] | None = None,
+    object_type: str = "",
 ) -> tuple[Polygon | None, float, float]:
     """
     방 전체를 x-y 그리드 순서로 스캔하여 제약 조건을 만족하는 후보를 수집.
@@ -269,6 +304,9 @@ def try_place_object(
                 test_y += GRID_STEP_MM
                 continue
             if any(obj_poly.intersects(p) for p in placed_polys):
+                test_y += GRID_STEP_MM
+                continue
+            if zone_constraints and not _zone_allows(obj_poly, object_type, zone_constraints):
                 test_y += GRID_STEP_MM
                 continue
             if check_access and not _is_accessible(obj_poly, placed_polys, room_poly, access_gap):
@@ -374,6 +412,7 @@ def try_place_cluster(
     entrance_pos: tuple[float, float] | None = None,
     clearspace_mm: float = MIN_ACCESS_GAP_MM,
     gap_mm: float = 50.0,
+    zone_constraints: list[tuple[Polygon, list[str] | None]] | None = None,
 ) -> tuple[list[tuple[Polygon, float, float]] | None, float, float]:
     """
     클러스터 전체를 하나의 단위로 배치.
@@ -404,13 +443,15 @@ def try_place_cluster(
         built = _build_polys(cluster_cx, cluster_cy)
         all_polys_for_cluster = [p for p, _, _ in built]
 
-        # 1) 모든 유닛이 방 안에 있고, dead_zone/placed_poly와 충돌 없음
+        # 1) 모든 유닛이 방 안에 있고, dead_zone/placed_poly/zone 제약 없음
         for poly, ux, uy in built:
             if not room_poly.contains(poly):
                 return False
             if any(poly.intersects(dz) for dz in dead_zones):
                 return False
             if any(poly.intersects(pp) for pp in placed_polys):
+                return False
+            if zone_constraints and not _zone_allows(poly, "product_display", zone_constraints):
                 return False
 
         # 2) 클러스터 전체 bounding box 앞면(miny 방향) 통로 확보
@@ -477,6 +518,7 @@ def try_place_cluster(
                 if not room_poly.contains(poly): return False
                 if any(poly.intersects(dz) for dz in dead_zones): return False
                 if any(poly.intersects(pp) for pp in placed_polys): return False
+                if zone_constraints and not _zone_allows(poly, "product_display", zone_constraints): return False
             all_p = [p for p, _, _ in built]
             bminx = min(p.bounds[0] for p in all_p)
             bminy = min(p.bounds[1] for p in all_p)
@@ -493,15 +535,39 @@ def try_place_cluster(
                     return True
             return False
 
-        candidates = [
-            (ref_cx, miny_r + wbbox_h / 2 + gap_mm),   # 북벽
-            (ref_cx, maxy_r - wbbox_h / 2 - gap_mm),   # 남벽
-            (minx_r + wbbox_w / 2 + gap_mm, ref_cy),    # 서벽
-            (maxx_r - wbbox_w / 2 - gap_mm, ref_cy),    # 동벽
+        # 4방향 벽별 후보 (중앙 우선, 실패 시 양 끝)
+        wall_candidates: list[tuple[float, tuple, tuple, tuple]] = [
+            # (ref_point까지 거리, 중앙, 왼쪽/위, 오른쪽/아래)
+            (
+                abs(ref_cy - miny_r),  # 북벽 거리
+                (ref_cx,                         miny_r + wbbox_h / 2 + gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+            ),
+            (
+                abs(ref_cy - maxy_r),  # 남벽 거리
+                (ref_cx,                         maxy_r - wbbox_h / 2 - gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
+            (
+                abs(ref_cx - minx_r),  # 서벽 거리
+                (minx_r + wbbox_w / 2 + gap_mm, ref_cy),
+                (minx_r + wbbox_w / 2 + gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (minx_r + wbbox_w / 2 + gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
+            (
+                abs(ref_cx - maxx_r),  # 동벽 거리
+                (maxx_r - wbbox_w / 2 - gap_mm, ref_cy),
+                (maxx_r - wbbox_w / 2 - gap_mm, miny_r + wbbox_h / 2 + gap_mm),
+                (maxx_r - wbbox_w / 2 - gap_mm, maxy_r - wbbox_h / 2 - gap_mm),
+            ),
         ]
-        for wcx, wcy in candidates:
-            if _wall_valid(wcx, wcy):
-                return _build_wall_polys(wcx, wcy), wcx, wcy
+        # ref_point에 가까운 벽부터 시도
+        for _, center, left, right in sorted(wall_candidates, key=lambda t: t[0]):
+            for pos in (center, left, right):
+                if _wall_valid(*pos):
+                    return _build_wall_polys(*pos), pos[0], pos[1]
         return None
 
     # 가로 단열 먼저, 실패 시 세로 단열 시도
@@ -589,7 +655,7 @@ def compute_layout(
     - blocking violation 있으면 glb_blocked = True
     """
     room_poly = Polygon(floor.room_polygon_mm)
-    dead_zones = build_dead_zones(floor, standards)
+    dead_zones = build_dead_zones(floor)
 
     placed_objects: list[PlacedObject] = []
     placed_polys: list[Polygon] = list(initial_placed_polys) if initial_placed_polys else []
@@ -600,6 +666,9 @@ def compute_layout(
     entrance_rp = next((rp for rp in floor.reference_points if rp.name == "entrance"), None)
     entrance_pos: tuple[float, float] | None = entrance_rp.position_mm if entrance_rp else None
     corridor_graph, _ = _build_walkability_graph(room_poly, dead_zones)
+
+    # zone 제약 (allowed_objects 있는 zone만 추출)
+    zone_constraints = _build_zone_constraints(floor)
 
     # 오브젝트 중요도(OBJECT_PRIORITY) 우선, 같으면 LLM이 부여한 priority 순
     sorted_placements = sorted(
@@ -648,16 +717,42 @@ def compute_layout(
                     corridor_graph=corridor_graph,
                     entrance_pos=entrance_pos,
                     clearspace_mm=max(standards.clearspace_mm, MIN_ACCESS_GAP_MM),
+                    zone_constraints=zone_constraints,
                 )
 
                 if result_units is None:
-                    for intent in sub_group:
-                        failed_objects.append({
-                            "object_type": "product_display",
-                            "reason": f"클러스터 배치 실패 — 방 전체 스캔에서 접근성을 만족하는 공간 없음",
-                            "reference_point": intent.reference_point,
-                        })
-                    continue
+                    # 클러스터가 너무 커서 실패 → 크기를 절반씩 줄이며 재시도
+                    reduced_sub_group = list(sub_group)
+                    while len(reduced_sub_group) > 1 and result_units is None:
+                        reduced_sub_group = reduced_sub_group[:len(reduced_sub_group) // 2]
+                        reduced_units = plan_cluster_layout(len(reduced_sub_group), pd_w, pd_d)[0]
+                        result_units, cluster_cx, cluster_cy = try_place_cluster(
+                            ref_pos[0], ref_pos[1],
+                            reduced_units, pd_w, pd_d,
+                            room_poly, dead_zones, placed_polys,
+                            corridor_graph=corridor_graph,
+                            entrance_pos=entrance_pos,
+                            clearspace_mm=max(standards.clearspace_mm, MIN_ACCESS_GAP_MM),
+                            zone_constraints=zone_constraints,
+                        )
+                    if result_units is not None:
+                        # 성공한 수만큼만 sub_group 축소, 나머지는 실패 처리
+                        n_placed = len(result_units)
+                        for intent in sub_group[n_placed:]:
+                            failed_objects.append({
+                                "object_type": "product_display",
+                                "reason": "클러스터 크기 초과 — 공간 부족으로 일부만 배치",
+                                "reference_point": intent.reference_point,
+                            })
+                        sub_group = sub_group[:n_placed]
+                    else:
+                        for intent in sub_group:
+                            failed_objects.append({
+                                "object_type": "product_display",
+                                "reason": "클러스터 배치 실패 — 방 전체 스캔에서 접근성을 만족하는 공간 없음",
+                                "reference_point": intent.reference_point,
+                            })
+                        continue
 
                 for (poly, ux, uy), intent in zip(result_units, sub_group):
                     violations: list[Violation] = []
@@ -726,6 +821,8 @@ def compute_layout(
             corridor_graph=corridor_graph,
             entrance_pos=entrance_pos,
             check_access=(intent.object_type not in ACCESSIBILITY_EXEMPT),
+            zone_constraints=zone_constraints,
+            object_type=intent.object_type,
         )
 
         if obj_poly is None:

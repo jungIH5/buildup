@@ -1,15 +1,19 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import axios from 'axios';
 import {
   Upload, Layout, AlertCircle, ArrowRight, Settings,
   Package, Layers, Box, RotateCcw, Trash2, PlusSquare,
   Undo2, RefreshCw, Send, ChevronDown, ChevronUp, RotateCw,
+  Download, MapPin, Eye,
 } from 'lucide-react';
 import './globals.css';
 
 import ThreeViewer from './components/ThreeViewer';
 import type { Wall } from './components/ThreeViewer';
 import FloorView2D from './components/FloorView2D';
+import type { ZoneDefinition, EditMode } from './components/FloorView2D';
+// ZoneDefinition & EditMode are re-exported from FloorView2D — no local redefinition needed
+import { checkCollisions } from './utils/collision';
 
 interface Placement {
   object_type: string;
@@ -26,6 +30,21 @@ interface Violation    { severity: string; object_type: string; rule: string; de
 interface DetectedEquip { equipment_type: string; position_mm: [number, number]; size_mm?: [number, number]; }
 interface BrandStandards { clearspace_mm: number; main_corridor_min_mm: number; source: string; [key: string]: unknown; }
 interface Summary { total_placed: number; total_failed: number; [key: string]: unknown; }
+
+interface ReferencePoint { name: string; position_mm: [number, number]; zone_label?: string; }
+interface Agent2Preview {
+  room_polygon_mm: [number, number][];
+  dead_zones_mm: [number, number][][];
+  zones: ZoneDefinition[];
+  reference_points: ReferencePoint[];
+  eligible_objects: string[];
+  scale_mm_per_px: number;
+  scale_confidence: string;
+  equipment_detected: DetectedEquip[];
+  floor_plan_png?: string;
+  _cache?: { floor: unknown; constraints: unknown; image_meta: unknown };
+}
+interface UserMarking { equipment_type: string; position_mm: [number, number]; }
 
 interface PipelineResult {
   placed: Placement[];
@@ -59,6 +78,22 @@ const OBJECT_COLORS: Record<string, string> = {
   banner_stand:    '#f59e0b',
   product_display: '#3b82f6',
 };
+// 오브젝트 크기/높이 — FloorView2D와 동일
+const FURNITURE_SIZES_FE: Record<string, [number, number]> = {
+  character_bbox:  [800, 800],
+  shelf_rental:    [600, 400],
+  photo_zone:      [1500, 1200],
+  banner_stand:    [600, 200],
+  product_display: [900, 600],
+};
+const FURNITURE_HEIGHTS_FE: Record<string, number> = {
+  character_bbox:  1800,
+  shelf_rental:    1500,
+  photo_zone:      2500,
+  banner_stand:    2200,
+  product_display: 1500,
+};
+
 const WALL_PRESETS = [
   { label: '1m', length: 1000 },
   { label: '2m', length: 2000 },
@@ -93,7 +128,63 @@ const App: React.FC = () => {
   const [selectedWallId, setSelectedWallId]         = useState<string | null>(null);
   const [viewMode, setViewMode]                     = useState<'3d' | '2d'>('3d');
 
-  // ── Undo ──
+  // 미배치 오브젝트 드래그앤드롭
+  const [draggingFailedType, setDraggingFailedType] = useState<string | null>(null);
+
+  // 앱 단계: idle → preview(도면 확인) → result(배치 완료)
+  const [appStep, setAppStep]                       = useState<'idle' | 'preview' | 'result'>('idle');
+
+  // Agent 2 미리보기
+  const [agent2Preview, setAgent2Preview]           = useState<Agent2Preview | null>(null);
+  const [isPreviewing, setIsPreviewing]             = useState(false);
+  // 사용자가 편집한 zone (초기엔 모두 allowed_objects=null — 제한없음)
+  const [userZones, setUserZones]                   = useState<ZoneDefinition[]>([]);
+  const [selectedZoneName, setSelectedZoneName]     = useState<string | null>(null);
+
+  // 편집 모드: view | mark_exit | mark_sprinkler | draw_zone
+  const [editMode, setEditMode]                     = useState<EditMode>('view');
+
+  // 수동 마킹
+  const [userMarkings, setUserMarkings]             = useState<UserMarking[]>([]);
+
+  // ── 편집 Undo (preview 단계 zone/마킹 편집용) ──
+  type EditSnapshot = { zones: ZoneDefinition[]; markings: UserMarking[] };
+  const editUndoStack = useRef<EditSnapshot[]>([]);
+
+  const pushEditHistory = (zones: ZoneDefinition[], markings: UserMarking[]) => {
+    editUndoStack.current = [
+      ...editUndoStack.current.slice(-29),
+      { zones: zones.map(z => ({ ...z, polygon_mm: [...z.polygon_mm] as [number,number][] })), markings: [...markings] },
+    ];
+  };
+
+  const setUserZonesWithHistory = (updater: (prev: ZoneDefinition[]) => ZoneDefinition[]) => {
+    setUserZones(prev => {
+      pushEditHistory(prev, userMarkings);
+      return updater(prev);
+    });
+  };
+
+  const setUserMarkingsWithHistory = (updater: (prev: UserMarking[]) => UserMarking[]) => {
+    setUserMarkings(prev => {
+      pushEditHistory(userZones, prev);
+      return updater(prev);
+    });
+  };
+
+  const handleEditUndo = () => {
+    if (!editUndoStack.current.length) return;
+    const snap = editUndoStack.current[editUndoStack.current.length - 1];
+    editUndoStack.current = editUndoStack.current.slice(0, -1);
+    setUserZones(snap.zones);
+    setUserMarkings(snap.markings);
+    setSelectedZoneName(null);
+  };
+
+  // ── 충돌 감지 ──
+  const collidingIndices = useMemo(() => checkCollisions(localPlaced, walls), [localPlaced, walls]);
+
+  // ── Undo (배치 결과 편집용) ──
   type Snapshot = { placed: Placement[]; walls: Wall[] };
   const undoStack = useRef<Snapshot[]>([]);
 
@@ -132,8 +223,21 @@ const App: React.FC = () => {
     setReqText('');
     const formData = new FormData();
     if (brandManual) formData.append('brand_manual', brandManual);
-    if (floorPlan)   formData.append('floor_plan', floorPlan);
+    // agent2Preview._cache가 있으면 Agent 2 스킵
+    if (agent2Preview?._cache) {
+      formData.append('pre_analyzed_floor', JSON.stringify({
+        ...agent2Preview._cache,
+        // 사용자가 편집한 zone 반영
+        floor: {
+          ...(agent2Preview._cache.floor as Record<string, unknown>),
+          zones: userZones.length > 0 ? userZones : (agent2Preview.zones ?? []),
+        },
+      }));
+    } else if (floorPlan) {
+      formData.append('floor_plan', floorPlan);
+    }
     if (allReqs)     formData.append('user_requirements', allReqs);
+    if (userMarkings.length > 0) formData.append('user_markings', JSON.stringify(userMarkings));
     try {
       const res = await axios.post('http://localhost:8000/api/pipeline/run', formData);
       setResult(res.data);
@@ -144,9 +248,12 @@ const App: React.FC = () => {
       if (res.data.floor_plan_png)
         setFloorPlanUrl(`data:image/png;base64,${res.data.floor_plan_png}`);
       setUploadOpen(false);
+      setAppStep('result');
+      setEditMode('view');
+      setSelectedZoneName(null);
     } catch (err) {
       console.error(err);
-      alert('분석 중 오류가 발생했습니다. 백엔드 서버를 확인하세요.');
+      alert(`분석 실패: ${getErrorMessage(err)}`);
     } finally {
       setIsProcessing(false);
     }
@@ -179,7 +286,7 @@ const App: React.FC = () => {
       undoStack.current = [];
     } catch (err) {
       console.error(err);
-      alert('재생성 중 오류가 발생했습니다.');
+      alert(`재생성 실패: ${getErrorMessage(err)}`);
     } finally {
       setIsProcessing(false);
     }
@@ -264,6 +371,63 @@ const App: React.FC = () => {
     setSelectedWallId(id);
   };
 
+  // ── 에러 메시지 추출 ──
+  const getErrorMessage = (err: unknown): string => {
+    if (axios.isAxiosError(err) && err.response?.data?.detail) {
+      return String(err.response.data.detail);
+    }
+    if (err instanceof Error) return err.message;
+    return '알 수 없는 오류가 발생했습니다.';
+  };
+
+  // ── Agent 2 도면 미리보기 (도면 선택 시 자동 실행) ──
+  const handlePreview = async (file?: File) => {
+    const target = file ?? floorPlan;
+    if (!target) return;
+    setIsPreviewing(true);
+    setAppStep('preview');
+    const formData = new FormData();
+    formData.append('floor_plan', target);
+    if (userMarkings.length > 0)
+      formData.append('user_markings', JSON.stringify(userMarkings));
+    try {
+      const res = await axios.post('http://localhost:8000/api/pipeline/agent2/review', formData);
+      setAgent2Preview(res.data);
+      // auto zone은 포토존 미지정 상태(null)로 초기화
+      setUserZones((res.data.zones ?? []).map((z: ZoneDefinition) => ({ ...z, allowed_objects: null })));
+      if (res.data.floor_plan_png)
+        setFloorPlanUrl(`data:image/png;base64,${res.data.floor_plan_png}`);
+    } catch (err) {
+      alert(`도면 분석 실패: ${getErrorMessage(err)}`);
+      setAppStep('idle');
+    } finally {
+      setIsPreviewing(false);
+    }
+  };
+
+  // ── GLB 내보내기 ──
+  const handleExportGlb = async () => {
+    if (!result) return;
+    try {
+      const res = await axios.post(
+        'http://localhost:8000/api/export/glb',
+        {
+          room_polygon_mm: result.room_polygon_mm ?? [],
+          placed_objects: localPlaced,
+          walls,
+        },
+        { responseType: 'blob' }
+      );
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'buildup_layout.glb';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(`GLB 내보내기 실패: ${getErrorMessage(err)}`);
+    }
+  };
+
   const canAnalyze = (!!floorPlan || !!brandManual) && !isProcessing;
 
   return (
@@ -340,7 +504,13 @@ const App: React.FC = () => {
                   </div>
                   <div className="border border-dashed border-border rounded-xl p-3 cursor-pointer hover:border-accent/50 transition-colors group">
                     <input type="file" className="hidden" accept="image/*,.pdf,.dxf,.dwg"
-                      onChange={e => setFloorPlan(e.target.files?.[0] || null)} />
+                      onChange={e => {
+                        const file = e.target.files?.[0] || null;
+                        setFloorPlan(file);
+                        setAgent2Preview(null);
+                        setUserZones([]);
+                        if (file) handlePreview(file);
+                      }} />
                     <div className="flex items-center gap-2">
                       <Upload size={14} className="text-text-muted group-hover:text-accent transition-colors shrink-0" />
                       <span className="text-xs text-text-muted truncate">
@@ -373,6 +543,150 @@ const App: React.FC = () => {
                   />
                 </div>
 
+                {/* 도면 재분석 버튼 (preview 단계) */}
+                {!result && floorPlan && (
+                  <button
+                    onClick={() => handlePreview()}
+                    disabled={isPreviewing || isProcessing}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl
+                               border border-accent/40 text-accent text-xs font-bold
+                               hover:bg-accent/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {isPreviewing ? (
+                      <><RefreshCw size={12} className="animate-spin" /> 도면 분석 중...</>
+                    ) : (
+                      <><Eye size={12} /> 도면 재분석</>
+                    )}
+                  </button>
+                )}
+
+                {/* preview 단계 — 공간 편집 패널 */}
+                {appStep === 'preview' && agent2Preview && !result && (
+                  <div className="border border-white/10 rounded-xl p-3 space-y-3 bg-white/5">
+
+                    {/* 헤더 + 실행취소 */}
+                    <div className="flex items-center justify-between">
+                      <p className="text-[10px] text-text-muted font-bold uppercase tracking-wider">공간 편집</p>
+                      <button
+                        onClick={handleEditUndo}
+                        disabled={editUndoStack.current.length === 0}
+                        title="실행취소 (Ctrl+Z)"
+                        className="flex items-center gap-1 px-2 py-0.5 rounded-lg border border-border
+                                   text-[10px] text-text-muted hover:text-white hover:bg-white/10
+                                   disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+                        ↩ 취소
+                      </button>
+                    </div>
+
+                    {/* 편집 도구 */}
+                    <div>
+                      <p className="text-[10px] text-text-muted mb-1.5">편집 도구</p>
+                      <div className="grid grid-cols-2 gap-1">
+                        {([
+                          { mode: 'view'           as EditMode, label: '선택/이동',   icon: '↖' },
+                          { mode: 'draw_zone'      as EditMode, label: '영역 그리기', icon: '▭' },
+                          { mode: 'mark_exit'      as EditMode, label: '비상구',      icon: '🚪' },
+                          { mode: 'mark_sprinkler' as EditMode, label: '스프링클러',  icon: '🔴' },
+                        ] as const).map(({ mode, label, icon }) => (
+                          <button key={mode}
+                            onClick={() => setEditMode(prev => prev === mode ? 'view' : mode)}
+                            className={`py-1.5 rounded-lg border text-[10px] font-bold transition-colors ${
+                              editMode === mode
+                                ? 'border-accent bg-accent/20 text-accent'
+                                : 'border-border text-text-muted hover:bg-white/5'
+                            }`}>
+                            {icon} {label}
+                          </button>
+                        ))}
+                      </div>
+                      {editMode === 'draw_zone' && (
+                        <p className="text-[10px] text-accent/70 mt-1.5 text-center">
+                          드래그로 영역을 그려주세요
+                        </p>
+                      )}
+                    </div>
+
+                    {/* 추가된 설비 목록 */}
+                    {userMarkings.length > 0 && (
+                      <div>
+                        <p className="text-[10px] text-text-muted mb-1">추가된 설비</p>
+                        <div className="space-y-0.5">
+                          {userMarkings.map((m, i) => (
+                            <div key={i} className="flex items-center justify-between px-2 py-1
+                                                    rounded bg-black/20 text-[10px] text-text-muted">
+                              <span>{m.equipment_type === 'exit' ? '🚪 비상구' : '🔴 스프링클러'}</span>
+                              <button onClick={() => setUserMarkingsWithHistory(prev => prev.filter((_, j) => j !== i))}
+                                className="text-red-400 hover:text-red-300">×</button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 구역 목록 */}
+                    {userZones.length > 0 && (
+                      <div>
+                        <p className="text-[10px] text-text-muted mb-1">구역 목록</p>
+                        <div className="space-y-1">
+                          {userZones.map(zone => {
+                            const isDead     = zone.allowed_objects !== null && zone.allowed_objects.length === 0;
+                            const isPhoto    = zone.allowed_objects !== null && zone.allowed_objects.includes('photo_zone');
+                            const isSelected = selectedZoneName === zone.name;
+                            const borderCls  = isDead  ? 'border-red-500/60 bg-red-500/10 text-red-300' :
+                                               isPhoto ? 'border-pink-500/60 bg-pink-500/10 text-pink-300' :
+                                               isSelected ? 'border-white/40 bg-white/10 text-white' :
+                                               'border-border text-text-muted hover:bg-white/5';
+                            return (
+                              <div key={zone.name}>
+                                {/* 행 — 클릭으로 선택 */}
+                                <div
+                                  className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-[10px] cursor-pointer transition-colors ${borderCls}`}
+                                  onClick={() => setSelectedZoneName(p => p === zone.name ? null : zone.name)}
+                                >
+                                  <span className="flex-1 truncate">
+                                    {zone.source === 'user_defined' ? '▭ ' : ''}
+                                    {isDead ? '🚫 ' : isPhoto ? '📸 ' : ''}
+                                    {zone.label.replace('_zone', '')}
+                                  </span>
+                                  {zone.source === 'user_defined' && (
+                                    <button
+                                      onClick={e => { e.stopPropagation();
+                                        setUserZonesWithHistory(prev => prev.filter(z => z.name !== zone.name));
+                                        if (selectedZoneName === zone.name) setSelectedZoneName(null);
+                                      }}
+                                      className="text-red-400 hover:text-red-300 shrink-0">×</button>
+                                  )}
+                                </div>
+
+                                {/* 선택된 zone 타입 변경 버튼 */}
+                                {isSelected && (
+                                  <div className="flex gap-1 mt-1 ml-1">
+                                    {[
+                                      { label: '제한없음', val: null,          cls: 'border-white/20 text-text-muted hover:bg-white/10', active: !isPhoto && !isDead },
+                                      { label: '📸 포토존', val: ['photo_zone'] as string[], cls: 'border-pink-500/40 text-pink-300 hover:bg-pink-500/10', active: isPhoto },
+                                      { label: '🚫 배치불가', val: [] as string[],           cls: 'border-red-500/40 text-red-400 hover:bg-red-500/10',  active: isDead },
+                                    ].map(opt => (
+                                      <button key={opt.label}
+                                        onClick={() => setUserZonesWithHistory(prev => prev.map(z =>
+                                          z.name === zone.name ? { ...z, allowed_objects: opt.val } : z
+                                        ))}
+                                        className={`flex-1 py-1 rounded border text-[9px] font-bold transition-colors ${opt.cls} ${
+                                          opt.active ? 'opacity-100 ring-1 ring-current' : 'opacity-60'
+                                        }`}>
+                                        {opt.label}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* 분석 시작 버튼 (결과 없을 때) */}
                 {!result && (
                   <button
@@ -385,7 +699,7 @@ const App: React.FC = () => {
                     {isProcessing ? (
                       <><RefreshCw size={14} className="animate-spin" /> AI 분석 중...</>
                     ) : (
-                      <><ArrowRight size={14} /> 분석 시작하기</>
+                      <><ArrowRight size={14} /> 배치 시작하기</>
                     )}
                   </button>
                 )}
@@ -461,6 +775,43 @@ const App: React.FC = () => {
           {/* 분석 완료 후 패널들 */}
           {result && (
             <>
+              {/* 수동 설비 마킹 (result 이후, 2D 뷰 전용) */}
+              {viewMode === '2d' && (
+              <div className="px-4 py-3 border-b border-border">
+                <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5">
+                  <MapPin size={13} className="text-accent" /> 설비 마킹
+                  <span className="ml-auto text-[10px] text-text-muted">2D 뷰</span>
+                </h4>
+                <div className="flex gap-1.5 mb-2">
+                  {([
+                    { mode: 'mark_exit'      as EditMode, label: '비상구' },
+                    { mode: 'mark_sprinkler' as EditMode, label: '스프링클러' },
+                  ]).map(({ mode, label }) => (
+                    <button key={mode}
+                      onClick={() => setEditMode(prev => prev === mode ? 'view' : mode)}
+                      className={`flex-1 py-1 rounded-lg border text-[10px] font-bold transition-colors ${
+                        editMode === mode
+                          ? 'border-accent bg-accent/20 text-accent'
+                          : 'border-border text-text-muted hover:bg-white/5'
+                      }`}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {userMarkings.length > 0 && (
+                  <div className="space-y-1">
+                    {userMarkings.map((m, i) => (
+                      <div key={i} className="flex items-center justify-between px-2 py-1 rounded bg-black/20 text-[10px] text-text-muted">
+                        <span>{m.equipment_type === 'exit' ? '🚪' : '🔴'} ({Math.round(m.position_mm[0])}, {Math.round(m.position_mm[1])})</span>
+                        <button onClick={() => setUserMarkings(prev => prev.filter((_, j) => j !== i))}
+                          className="text-red-400 hover:text-red-300 ml-1">×</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              )}
+
               {/* 가벽 설치 */}
               <div className="px-4 py-3 border-b border-border">
                 <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5">
@@ -566,14 +917,39 @@ const App: React.FC = () => {
                 <div className="px-4 py-3 border-b border-border">
                   <h4 className="text-xs font-bold mb-2 flex items-center gap-1.5 text-red-400">
                     <AlertCircle size={13} /> 미배치 ({result.failed.length})
+                    {viewMode === '2d' && (
+                      <span className="ml-auto text-[9px] text-text-muted font-normal">2D뷰로 드래그해서 배치</span>
+                    )}
                   </h4>
                   <div className="space-y-1.5">
-                    {result.failed.map((f, i) => (
-                      <div key={i} className="px-2.5 py-2 rounded-lg bg-red-500/5 border border-red-500/10">
-                        <div className="text-xs font-bold text-text-main">{OBJECT_NAMES[f.object_type] ?? f.object_type}</div>
-                        <div className="text-[10px] text-text-muted mt-0.5 leading-relaxed">{f.reason}</div>
-                      </div>
-                    ))}
+                    {result.failed.map((f, i) => {
+                      const color = OBJECT_COLORS[f.object_type] ?? '#64748b';
+                      const isDragging = draggingFailedType === f.object_type;
+                      return (
+                        <div key={i}
+                          draggable={viewMode === '2d'}
+                          onDragStart={(e) => {
+                            e.dataTransfer.setData('application/x-object-type', f.object_type);
+                            e.dataTransfer.effectAllowed = 'copy';
+                            setDraggingFailedType(f.object_type);
+                          }}
+                          onDragEnd={() => setDraggingFailedType(null)}
+                          className={`px-2.5 py-2 rounded-lg border transition-all select-none
+                            ${viewMode === '2d' ? 'cursor-grab active:cursor-grabbing' : ''}
+                            ${isDragging
+                              ? 'border-white/40 bg-white/10 opacity-60'
+                              : 'bg-red-500/5 border-red-500/10 hover:border-red-500/30'
+                            }`}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-sm shrink-0" style={{ backgroundColor: color }} />
+                            <span className="text-xs font-bold text-text-main">{OBJECT_NAMES[f.object_type] ?? f.object_type}</span>
+                            {viewMode === '2d' && <span className="ml-auto text-[9px] text-text-muted">⠿</span>}
+                          </div>
+                          <div className="text-[10px] text-text-muted mt-0.5 leading-relaxed">{f.reason}</div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -643,6 +1019,12 @@ const App: React.FC = () => {
                                hover:text-white hover:bg-white/10 transition-colors">
                     <Undo2 size={12} /> 되돌리기
                   </button>
+                  <button onClick={handleExportGlb}
+                    title="GLB 3D 파일 내보내기"
+                    className="flex items-center gap-1 px-2 py-1 rounded-lg border border-accent/40 text-[11px] font-bold text-accent
+                               hover:bg-accent/10 transition-colors">
+                    <Download size={12} /> GLB 내보내기
+                  </button>
                 </>
               )}
               <div className="flex rounded-lg border border-border overflow-hidden text-[11px] font-bold">
@@ -660,6 +1042,77 @@ const App: React.FC = () => {
 
           {/* Viewer canvas */}
           <div className="flex-1 bg-[#0a0f1d] relative overflow-hidden">
+            {/* 충돌 경고 배지 */}
+            {collidingIndices.size > 0 && result && (
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2
+                              bg-red-900/80 backdrop-blur-sm border border-red-500/60
+                              text-red-300 text-xs font-semibold px-3 py-1.5 rounded-full pointer-events-none">
+                <AlertCircle size={13} />
+                오브젝트 {collidingIndices.size}개 충돌 중
+              </div>
+            )}
+            {/* Agent 2 미리보기 — step: preview */}
+            {appStep === 'preview' && agent2Preview && !result && (
+              <div className="absolute inset-0 z-10">
+                <FloorView2D
+                  roomPolygon={agent2Preview.room_polygon_mm}
+                  placedObjects={[]}
+                  detectedObjects={agent2Preview.equipment_detected}
+                  deadZones={agent2Preview.dead_zones_mm}
+                  zones={userZones.length > 0 ? userZones : agent2Preview.zones}
+                  userMarkings={userMarkings}
+                  editMode={editMode}
+                  selectedZoneName={selectedZoneName}
+                  onZoneSelect={setSelectedZoneName}
+                  onZoneDrag={(name, newPoly) =>
+                    setUserZones(prev => prev.map(z => z.name === name ? { ...z, polygon_mm: newPoly } : z))
+                  }
+                  onZoneDraw={(polygon_mm) => {
+                    const id = `user_zone_${Date.now()}`;
+                    setUserZones(prev => [...prev, {
+                      name: id, polygon_mm, label: 'custom',
+                      allowed_objects: null, source: 'user_defined',
+                    }]);
+                    setEditMode('view');
+                  }}
+                  onMapClick={(x, y) => {
+                    const type = editMode === 'mark_exit' ? 'exit' : 'sprinkler';
+                    setUserMarkings(prev => [...prev, { equipment_type: type, position_mm: [x, y] }]);
+                    setEditMode('view');
+                  }}
+                />
+                {/* 상단 안내 바 */}
+                <div className="absolute top-3 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/80 backdrop-blur-sm
+                                text-xs px-4 py-2 rounded-full border border-white/10 pointer-events-none">
+                  {isPreviewing
+                    ? <><RefreshCw size={11} className="animate-spin text-accent" /> 도면 분석 중...</>
+                    : editMode === 'draw_zone'
+                      ? <><span className="text-pink-400">▭</span> 드래그로 영역을 그려주세요</>
+                      : editMode === 'mark_exit'
+                        ? <><span className="text-green-400">🚪</span> 비상구 위치를 클릭하세요</>
+                        : editMode === 'mark_sprinkler'
+                          ? <><span className="text-red-400">🔴</span> 스프링클러 위치를 클릭하세요</>
+                          : <><Eye size={11} className="text-accent" /> 공간 확인 후 &nbsp;<span className="text-accent font-bold">배치 시작</span>&nbsp; 버튼을 눌러주세요</>
+                  }
+                </div>
+                {/* zone 범례 */}
+                <div className="absolute bottom-8 right-4 flex flex-col gap-1 text-[10px] bg-black/50 px-2 py-1.5 rounded-lg">
+                  {[
+                    { label: 'entrance', color: 'rgba(34,197,94,0.3)',  border: '#22c55e' },
+                    { label: 'mid',      color: 'rgba(99,102,241,0.3)', border: '#6366f1' },
+                    { label: 'deep',     color: 'rgba(245,158,11,0.3)', border: '#f59e0b' },
+                    { label: '포토존',   color: 'rgba(236,72,153,0.3)', border: '#ec4899' },
+                    { label: 'dead zone',color: 'rgba(239,68,68,0.2)',  border: '#ef4444' },
+                  ].map(({ label, color, border }) => (
+                    <div key={label} className="flex items-center gap-1.5">
+                      <span className="w-3 h-3 rounded-sm shrink-0" style={{ background: color, border: `1px solid ${border}` }} />
+                      <span className="text-text-muted">{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {result ? (
               viewMode === '3d' ? (
                 <ThreeViewer
@@ -672,6 +1125,7 @@ const App: React.FC = () => {
                   imageSizePx={result.image_size_px}
                   selectedIndices={selectedObjectIndices}
                   selectedWallId={selectedWallId}
+                  collidingIndices={collidingIndices}
                   onObjectClick={(idx, shiftKey) => handleObjectClick(idx, shiftKey)}
                   onWallClick={id => { setSelectedWallId(p => p === id ? null : id); setSelectedObjectIndices([]); }}
                   onObjectMove={handleObjectMove}
@@ -686,8 +1140,47 @@ const App: React.FC = () => {
                   detectedObjects={result.equipment_detected || []}
                   walls={walls}
                   selectedIndices={selectedObjectIndices}
+                  collidingIndices={collidingIndices}
                   onObjectClick={(idx, shiftKey) => handleObjectClick(idx, shiftKey)}
                   onObjectRotate={handleObjectRotate}
+                  userMarkings={userMarkings}
+                  editMode={editMode}
+                  zones={userZones}
+                  deadZones={agent2Preview?.dead_zones_mm ?? []}
+                  draggingObjectType={draggingFailedType}
+                  onObjectDrop={(objectType, x, y) => {
+                    const [w, h] = FURNITURE_SIZES_FE[objectType] ?? [600, 400];
+                    const height = FURNITURE_HEIGHTS_FE[objectType] ?? 1500;
+                    pushHistory(localPlaced, walls);
+                    setLocalPlaced(prev => [...prev, {
+                      object_type: objectType,
+                      position_mm: [x, y] as [number, number],
+                      rotation_deg: 0,
+                      bbox_mm: [w, h] as [number, number],
+                      height_mm: height,
+                      reference_point: 'manual',
+                      placed_because: '사용자 수동 배치',
+                    }]);
+                    setResult(prev => {
+                      if (!prev) return prev;
+                      const idx = prev.failed.findIndex(f => f.object_type === objectType);
+                      if (idx === -1) return prev;
+                      return {
+                        ...prev,
+                        failed: prev.failed.filter((_, i) => i !== idx),
+                        summary: {
+                          ...prev.summary,
+                          total_placed: prev.summary.total_placed + 1,
+                          total_failed: prev.summary.total_failed - 1,
+                        },
+                      };
+                    });
+                  }}
+                  onMapClick={(x, y) => {
+                    const type = editMode === 'mark_exit' ? 'exit' : 'sprinkler';
+                    setUserMarkings(prev => [...prev, { equipment_type: type, position_mm: [x, y] }]);
+                    setEditMode('view');
+                  }}
                 />
               )
             ) : (
